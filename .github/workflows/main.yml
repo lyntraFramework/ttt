@@ -2,11 +2,6 @@ name: Smart Builder
 
 on:
   workflow_dispatch:
-    inputs:
-      raw_url:
-        description: 'URL to raw configuration file'
-        required: true
-        default: ''
 
 jobs:
   analyze-and-build:
@@ -18,38 +13,38 @@ jobs:
       - name: Fetch configuration
         run: |
           RAW_URL="${{ secrets.BUILD_CONFIG_RAW }}"
+          
           if [ -z "$RAW_URL" ]; then
             echo "ERROR: BUILD_CONFIG_RAW secret not set"
+            echo "Go to: Settings -> Secrets and variables -> Actions -> New repository secret"
+            echo "Name: BUILD_CONFIG_RAW"
+            echo "Value: your raw config URL"
             exit 1
           fi
           
           echo "Fetching configuration..."
-          curl -s -A "Mozilla/5.0" "$RAW_URL" > build_config.json
+          curl -s -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" "$RAW_URL" > build_config.json
           
           echo "Configuration content (first 500 chars):"
           head -c 500 build_config.json
           echo ""
           
-          # Validate JSON
           if ! jq empty build_config.json 2>/dev/null; then
             echo "ERROR: Invalid JSON in configuration file"
             exit 1
           fi
           
           echo "Configuration validated successfully"
-          cat build_config.json | jq '.'
 
       - name: Analyze configuration
         id: analyze
         run: |
-          # Extract project info
           PROJECT_NAME=$(jq -r '.project_name // "unknown-project"' build_config.json)
           PROJECT_TYPE=$(jq -r '.type // "unknown"' build_config.json)
           
           echo "project_name=$PROJECT_NAME" >> $GITHUB_OUTPUT
           echo "project_type=$PROJECT_TYPE" >> $GITHUB_OUTPUT
           
-          # Count steps by type
           APT_STEPS=$(jq '[.steps[] | select(.type == "apt_install")] | length' build_config.json)
           GIT_STEPS=$(jq '[.steps[] | select(.type == "git_clone")] | length' build_config.json)
           DOWNLOAD_STEPS=$(jq '[.steps[] | select(.type == "download")] | length' build_config.json)
@@ -63,7 +58,6 @@ jobs:
           echo "  - Build steps: $BUILD_STEPS"
           echo "  - Script steps: $SCRIPT_STEPS"
           
-          # Determine if we need cross-compilation
           NEEDS_CROSS="false"
           if [[ "$PROJECT_TYPE" == "rust" ]] || [[ "$BUILD_STEPS" -gt 0 ]]; then
             NEEDS_CROSS="true"
@@ -74,18 +68,11 @@ jobs:
       - name: Install dependencies
         run: |
           set -e
+          sudo apt-get update
           
-          echo "Installing system dependencies..."
-          
-          # Process apt_install steps
-          apt-get update
-          
-          jq -c '.steps[] | select(.type == "apt_install")' build_config.json | while read -r step; do
-            PACKAGES=$(echo "$step" | jq -r '.packages[]' | tr '\n' ' ')
-            if [ -n "$PACKAGES" ]; then
-              echo "Installing packages: $PACKAGES"
-              apt-get install -y $PACKAGES
-            fi
+          jq -r '.steps[] | select(.type == "apt_install") | .packages[]' build_config.json | while read -r pkg; do
+            echo "Installing: $pkg"
+            sudo apt-get install -y "$pkg" || echo "Warning: failed to install $pkg"
           done
           
           echo "System dependencies installed"
@@ -121,9 +108,9 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-          key: cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-registry-smart-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            cargo-registry-
+            cargo-registry-smart-
 
       - name: Download sources
         run: |
@@ -131,7 +118,6 @@ jobs:
           mkdir -p sources
           cd sources
           
-          # Process git_clone steps
           jq -c '.steps[] | select(.type == "git_clone")' ../build_config.json | while read -r step; do
             URL=$(echo "$step" | jq -r '.url')
             BRANCH=$(echo "$step" | jq -r '.branch // "main"')
@@ -141,7 +127,6 @@ jobs:
             git clone --depth 1 --branch "$BRANCH" "$URL" "$NAME"
           done
           
-          # Process download steps
           jq -c '.steps[] | select(.type == "download")' ../build_config.json | while read -r step; do
             URL=$(echo "$step" | jq -r '.url')
             FILENAME=$(echo "$step" | jq -r '.filename // "downloaded_file"')
@@ -149,7 +134,6 @@ jobs:
             echo "Downloading $URL to $FILENAME"
             curl -L -o "$FILENAME" "$URL"
             
-            # Extract if it's an archive
             if [[ "$FILENAME" == *.tar.gz ]] || [[ "$FILENAME" == *.tgz ]]; then
               echo "Extracting $FILENAME"
               tar -xzf "$FILENAME"
@@ -167,24 +151,14 @@ jobs:
           set -e
           cd sources
           
-          # Process build steps
           jq -c '.steps[] | select(.type == "build")' ../build_config.json | while read -r step; do
             COMMAND=$(echo "$step" | jq -r '.command')
             WORKDIR=$(echo "$step" | jq -r '.workdir // "."')
-            TARGET=$(echo "$step" | jq -r '.target // ""')
             
-            echo "Executing build command: $COMMAND"
-            echo "Working directory: $WORKDIR"
+            echo "Executing: $COMMAND in $WORKDIR"
             
             if [ "$WORKDIR" != "." ]; then
               cd "$WORKDIR"
-            fi
-            
-            # Add cross compilation target if specified
-            if [ -n "$TARGET" ] && [[ "$COMMAND" == *"cargo build"* ]]; then
-              if [[ ! "$COMMAND" == *"--target"* ]]; then
-                COMMAND="$COMMAND --target $TARGET"
-              fi
             fi
             
             eval "$COMMAND"
@@ -194,7 +168,6 @@ jobs:
             fi
           done
           
-          # Process script steps
           jq -c '.steps[] | select(.type == "script")' ../build_config.json | while read -r step; do
             CONTENT=$(echo "$step" | jq -r '.content')
             
@@ -215,35 +188,29 @@ jobs:
           
           PROJECT_NAME="${{ steps.analyze.outputs.project_name }}"
           
-          echo "Searching for binary..."
+          echo "Searching for binary: $PROJECT_NAME"
           
-          # Common binary locations
           BINARY_PATH=""
           
-          # Search in target/release for Rust projects
           if [ -d "target" ]; then
             BINARY_PATH=$(find target -name "$PROJECT_NAME" -type f -executable | head -1)
           fi
           
-          # Search in current directory
           if [ -z "$BINARY_PATH" ]; then
             BINARY_PATH=$(find . -name "$PROJECT_NAME" -type f -executable | head -1)
           fi
           
-          # Search in bin directories
           if [ -z "$BINARY_PATH" ]; then
             BINARY_PATH=$(find . -path "*/bin/$PROJECT_NAME" -type f -executable | head -1)
           fi
           
-          # If still not found, get any executable
           if [ -z "$BINARY_PATH" ]; then
-            BINARY_PATH=$(find . -type f -executable ! -path "*/\.*" | head -1)
+            BINARY_PATH=$(find . -type f -executable ! -path "*/\.*" ! -name "*.sh" | head -1)
           fi
           
           if [ -z "$BINARY_PATH" ]; then
             echo "ERROR: No binary found"
-            echo "Available files:"
-            find . -type f ! -path "*/\.*" | head -20
+            find . -type f ! -path "*/\.*" | head -30
             exit 1
           fi
           
@@ -345,4 +312,5 @@ jobs:
         if: always()
         run: |
           rm -f build_config.json
-          find . -type f -not -path '*/\.*' -not -path './.github/*' -delete 2>/dev/null || true
+          rm -rf sources
+          echo "Cleaned up"
