@@ -16,18 +16,11 @@ jobs:
           
           if [ -z "$RAW_URL" ]; then
             echo "ERROR: BUILD_CONFIG_RAW secret not set"
-            echo "Go to: Settings -> Secrets and variables -> Actions -> New repository secret"
-            echo "Name: BUILD_CONFIG_RAW"
-            echo "Value: your raw config URL"
             exit 1
           fi
           
           echo "Fetching configuration..."
           curl -s -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" "$RAW_URL" > build_config.json
-          
-          echo "Configuration content (first 500 chars):"
-          head -c 500 build_config.json
-          echo ""
           
           if ! jq empty build_config.json 2>/dev/null; then
             echo "ERROR: Invalid JSON in configuration file"
@@ -70,9 +63,7 @@ jobs:
           set -e
           sudo apt-get update
           
-          # تثبيت jq إذا لم يكن موجوداً
           if ! command -v jq &> /dev/null; then
-            echo "Installing jq..."
             sudo apt-get install -y jq
           fi
           
@@ -87,7 +78,7 @@ jobs:
         if: steps.analyze.outputs.needs_cross == 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: armv7-unknown-linux-gnueabihf
+          targets: armv7-unknown-linux-musleabihf
 
       - name: Cache cross binary
         if: steps.analyze.outputs.needs_cross == 'true'
@@ -95,7 +86,7 @@ jobs:
         id: cache-cross
         with:
           path: ~/.cargo/bin/cross
-          key: cross-binary-${{ runner.os }}-v1
+          key: cross-binary-${{ runner.os }}-v2
 
       - name: Install cargo-binstall
         if: steps.analyze.outputs.needs_cross == 'true' && steps.cache-cross.outputs.cache-hit != 'true'
@@ -141,16 +132,13 @@ jobs:
             curl -L -o "$FILENAME" "$URL"
             
             if [[ "$FILENAME" == *.tar.gz ]] || [[ "$FILENAME" == *.tgz ]]; then
-              echo "Extracting $FILENAME"
               tar -xzf "$FILENAME"
             elif [[ "$FILENAME" == *.zip ]]; then
-              echo "Extracting $FILENAME"
               unzip -q "$FILENAME"
             fi
           done
           
           echo "All sources downloaded"
-          ls -la
 
       - name: Execute build steps
         run: |
@@ -198,7 +186,6 @@ jobs:
           
           BINARY_PATH=""
           
-          # البحث في target لمشاريع Rust
           if [ -d "target" ]; then
             BINARY_PATH=$(find target -name "$PROJECT_NAME" -type f -executable | head -1)
           fi
@@ -217,14 +204,15 @@ jobs:
           
           if [ -z "$BINARY_PATH" ]; then
             echo "ERROR: No binary found"
-            echo "Available files:"
             find . -type f ! -path "*/\.*" | head -30
             exit 1
           fi
           
           echo "Found binary: $BINARY_PATH"
           
-          # نسخ الملف إلى المجلد الجذري مع اسم موحد
+          # Strip binary to reduce size
+          strip "$BINARY_PATH" 2>/dev/null || true
+          
           cp "$BINARY_PATH" "../$PROJECT_NAME"
           chmod +x "../$PROJECT_NAME"
           
@@ -232,7 +220,6 @@ jobs:
           FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
           echo "Binary size: $FILE_SIZE_MB MB"
           
-          # إرجاع المسار الجديد (من المجلد الجذري)
           echo "binary_path=$PROJECT_NAME" >> $GITHUB_OUTPUT
           echo "binary_size=$FILE_SIZE_MB" >> $GITHUB_OUTPUT
 
@@ -263,9 +250,17 @@ jobs:
             console.log('Connected as bot');
 
             const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-            const fileName = `${projectName}_armv7_${timestamp}`;
+            const fileName = `${projectName}_armv7l_proot_${timestamp}`;
 
-            const caption = `Build Successful\nProject: ${projectName}\nTarget: armv7-unknown-linux-gnueabihf\nDate: ${timestamp}\nSize: ${binarySize} MB\n\nRun:\nchmod +x ${fileName}\n./${fileName}`;
+            const caption = `✅ Build Successful (PRoot Compatible)\n` +
+                           `📦 Project: ${projectName}\n` +
+                           `🎯 Target: armv7l-musl (32-bit PRoot)\n` +
+                           `📅 Date: ${timestamp}\n` +
+                           `💾 Size: ${binarySize} MB\n\n` +
+                           `🔧 Installation:\n` +
+                           `chmod +x ${fileName}\n` +
+                           `mv ${fileName} /usr/local/bin/${projectName}\n` +
+                           `${projectName} --version`;
 
             let entity = null;
 
