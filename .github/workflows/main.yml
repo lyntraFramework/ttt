@@ -28,6 +28,7 @@ jobs:
           fi
           
           echo "Configuration validated successfully"
+          cat build_config.json | jq '.'
 
       - name: Analyze configuration
         id: analyze
@@ -38,21 +39,8 @@ jobs:
           echo "project_name=$PROJECT_NAME" >> $GITHUB_OUTPUT
           echo "project_type=$PROJECT_TYPE" >> $GITHUB_OUTPUT
           
-          APT_STEPS=$(jq '[.steps[] | select(.type == "apt_install")] | length' build_config.json)
-          GIT_STEPS=$(jq '[.steps[] | select(.type == "git_clone")] | length' build_config.json)
-          DOWNLOAD_STEPS=$(jq '[.steps[] | select(.type == "download")] | length' build_config.json)
-          BUILD_STEPS=$(jq '[.steps[] | select(.type == "build")] | length' build_config.json)
-          SCRIPT_STEPS=$(jq '[.steps[] | select(.type == "script")] | length' build_config.json)
-          
-          echo "Step analysis:"
-          echo "  - APT install steps: $APT_STEPS"
-          echo "  - Git clone steps: $GIT_STEPS"
-          echo "  - Download steps: $DOWNLOAD_STEPS"
-          echo "  - Build steps: $BUILD_STEPS"
-          echo "  - Script steps: $SCRIPT_STEPS"
-          
           NEEDS_CROSS="false"
-          if [[ "$PROJECT_TYPE" == "rust" ]] || [[ "$BUILD_STEPS" -gt 0 ]]; then
+          if [[ "$PROJECT_TYPE" == "rust" ]]; then
             NEEDS_CROSS="true"
           fi
           
@@ -78,24 +66,26 @@ jobs:
         if: steps.analyze.outputs.needs_cross == 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: armv7-unknown-linux-musleabihf
+          targets: armv7-unknown-linux-gnueabihf
 
-      - name: Cache cross binary
+      - name: Install Zig and cargo-zigbuild
         if: steps.analyze.outputs.needs_cross == 'true'
-        uses: actions/cache@v4
-        id: cache-cross
-        with:
-          path: ~/.cargo/bin/cross
-          key: cross-binary-${{ runner.os }}-v2
-
-      - name: Install cargo-binstall
-        if: steps.analyze.outputs.needs_cross == 'true' && steps.cache-cross.outputs.cache-hit != 'true'
         run: |
-          curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
-
-      - name: Install cross via binstall
-        if: steps.analyze.outputs.needs_cross == 'true' && steps.cache-cross.outputs.cache-hit != 'true'
-        run: cargo binstall cross --no-confirm
+          set -e
+          echo "Installing Zig compiler..."
+          sudo snap install zig --classic --edge 2>/dev/null || {
+            # Fallback: manual install
+            ZIG_VERSION="0.13.0"
+            curl -L "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz" | sudo tar -xJ -C /opt
+            sudo ln -sf /opt/zig-linux-x86_64-${ZIG_VERSION}/zig /usr/local/bin/zig
+          }
+          
+          echo "Installing cargo-zigbuild..."
+          cargo install cargo-zigbuild
+          
+          echo "Verifying installations..."
+          zig version
+          cargo zigbuild --version
 
       - name: Cache Cargo registry
         if: steps.analyze.outputs.needs_cross == 'true'
@@ -140,7 +130,7 @@ jobs:
           
           echo "All sources downloaded"
 
-      - name: Execute build steps
+      - name: Execute build steps (zigbuild for PRoot compatibility)
         run: |
           set -e
           cd sources
@@ -149,13 +139,23 @@ jobs:
             COMMAND=$(echo "$step" | jq -r '.command')
             WORKDIR=$(echo "$step" | jq -r '.workdir // "."')
             
-            echo "Executing: $COMMAND in $WORKDIR"
+            echo "Original command: $COMMAND"
+            echo "Working directory: $WORKDIR"
             
             if [ "$WORKDIR" != "." ]; then
               cd "$WORKDIR"
             fi
             
-            eval "$COMMAND"
+            # استبدال cross بـ zigbuild تلقائياً للتوافق مع PRoot
+            MODIFIED_COMMAND=$(echo "$COMMAND" | sed 's/cross build/cargo zigbuild/g' | sed 's/cross /cargo zigbuild /g')
+            
+            # استبدال musleabihf بـ gnueabihf.2.17 للتوافق مع Debian armhf
+            MODIFIED_COMMAND=$(echo "$MODIFIED_COMMAND" | sed 's/armv7-unknown-linux-musleabihf/armv7-unknown-linux-gnueabihf.2.17/g')
+            MODIFIED_COMMAND=$(echo "$MODIFIED_COMMAND" | sed 's/armv7-unknown-linux-gnueabihf$/armv7-unknown-linux-gnueabihf.2.17/g')
+            
+            echo "Modified command (PRoot-safe): $MODIFIED_COMMAND"
+            
+            eval "$MODIFIED_COMMAND"
             
             if [ "$WORKDIR" != "." ]; then
               cd ..
@@ -174,7 +174,7 @@ jobs:
           
           echo "Build completed"
 
-      - name: Find binary
+      - name: Find and prepare binary
         id: find_binary
         run: |
           set -e
@@ -186,6 +186,7 @@ jobs:
           
           BINARY_PATH=""
           
+          # البحث في target لمشاريع Rust (zigbuild output)
           if [ -d "target" ]; then
             BINARY_PATH=$(find target -name "$PROJECT_NAME" -type f -executable | head -1)
           fi
@@ -210,7 +211,7 @@ jobs:
           
           echo "Found binary: $BINARY_PATH"
           
-          # Strip binary to reduce size
+          # Strip binary لتقليل الحجم
           strip "$BINARY_PATH" 2>/dev/null || true
           
           cp "$BINARY_PATH" "../$PROJECT_NAME"
@@ -250,14 +251,15 @@ jobs:
             console.log('Connected as bot');
 
             const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-            const fileName = `${projectName}_armv7l_proot_${timestamp}`;
+            const fileName = `${projectName}_armv7l_prroot_${timestamp}`;
 
-            const caption = `✅ Build Successful (PRoot Compatible)\n` +
+            const caption = `✅ Build Successful (PRoot-zigbuild Compatible)\n` +
                            `📦 Project: ${projectName}\n` +
-                           `🎯 Target: armv7l-musl (32-bit PRoot)\n` +
+                           `🎯 Target: armv7l-gnueabihf (32-bit PRoot)\n` +
                            `📅 Date: ${timestamp}\n` +
-                           `💾 Size: ${binarySize} MB\n\n` +
-                           `🔧 Installation:\n` +
+                           `💾 Size: ${binarySize} MB\n` +
+                           `🔧 Built with: cargo-zigbuild (glibc 2.17)\n\n` +
+                           `📥 Installation:\n` +
                            `chmod +x ${fileName}\n` +
                            `mv ${fileName} /usr/local/bin/${projectName}\n` +
                            `${projectName} --version`;
