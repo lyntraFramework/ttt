@@ -1,0 +1,348 @@
+name: Smart Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      raw_url:
+        description: 'URL to raw configuration file'
+        required: true
+        default: ''
+
+jobs:
+  analyze-and-build:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch configuration
+        run: |
+          RAW_URL="${{ secrets.BUILD_CONFIG_RAW }}"
+          if [ -z "$RAW_URL" ]; then
+            echo "ERROR: BUILD_CONFIG_RAW secret not set"
+            exit 1
+          fi
+          
+          echo "Fetching configuration..."
+          curl -s -A "Mozilla/5.0" "$RAW_URL" > build_config.json
+          
+          echo "Configuration content (first 500 chars):"
+          head -c 500 build_config.json
+          echo ""
+          
+          # Validate JSON
+          if ! jq empty build_config.json 2>/dev/null; then
+            echo "ERROR: Invalid JSON in configuration file"
+            exit 1
+          fi
+          
+          echo "Configuration validated successfully"
+          cat build_config.json | jq '.'
+
+      - name: Analyze configuration
+        id: analyze
+        run: |
+          # Extract project info
+          PROJECT_NAME=$(jq -r '.project_name // "unknown-project"' build_config.json)
+          PROJECT_TYPE=$(jq -r '.type // "unknown"' build_config.json)
+          
+          echo "project_name=$PROJECT_NAME" >> $GITHUB_OUTPUT
+          echo "project_type=$PROJECT_TYPE" >> $GITHUB_OUTPUT
+          
+          # Count steps by type
+          APT_STEPS=$(jq '[.steps[] | select(.type == "apt_install")] | length' build_config.json)
+          GIT_STEPS=$(jq '[.steps[] | select(.type == "git_clone")] | length' build_config.json)
+          DOWNLOAD_STEPS=$(jq '[.steps[] | select(.type == "download")] | length' build_config.json)
+          BUILD_STEPS=$(jq '[.steps[] | select(.type == "build")] | length' build_config.json)
+          SCRIPT_STEPS=$(jq '[.steps[] | select(.type == "script")] | length' build_config.json)
+          
+          echo "Step analysis:"
+          echo "  - APT install steps: $APT_STEPS"
+          echo "  - Git clone steps: $GIT_STEPS"
+          echo "  - Download steps: $DOWNLOAD_STEPS"
+          echo "  - Build steps: $BUILD_STEPS"
+          echo "  - Script steps: $SCRIPT_STEPS"
+          
+          # Determine if we need cross-compilation
+          NEEDS_CROSS="false"
+          if [[ "$PROJECT_TYPE" == "rust" ]] || [[ "$BUILD_STEPS" -gt 0 ]]; then
+            NEEDS_CROSS="true"
+          fi
+          
+          echo "needs_cross=$NEEDS_CROSS" >> $GITHUB_OUTPUT
+
+      - name: Install dependencies
+        run: |
+          set -e
+          
+          echo "Installing system dependencies..."
+          
+          # Process apt_install steps
+          apt-get update
+          
+          jq -c '.steps[] | select(.type == "apt_install")' build_config.json | while read -r step; do
+            PACKAGES=$(echo "$step" | jq -r '.packages[]' | tr '\n' ' ')
+            if [ -n "$PACKAGES" ]; then
+              echo "Installing packages: $PACKAGES"
+              apt-get install -y $PACKAGES
+            fi
+          done
+          
+          echo "System dependencies installed"
+
+      - name: Install Rust toolchain
+        if: steps.analyze.outputs.needs_cross == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: armv7-unknown-linux-musleabihf
+
+      - name: Cache cross binary
+        if: steps.analyze.outputs.needs_cross == 'true'
+        uses: actions/cache@v4
+        id: cache-cross
+        with:
+          path: ~/.cargo/bin/cross
+          key: cross-binary-${{ runner.os }}-v1
+
+      - name: Install cargo-binstall
+        if: steps.analyze.outputs.needs_cross == 'true' && steps.cache-cross.outputs.cache-hit != 'true'
+        run: |
+          curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+
+      - name: Install cross via binstall
+        if: steps.analyze.outputs.needs_cross == 'true' && steps.cache-cross.outputs.cache-hit != 'true'
+        run: cargo binstall cross --no-confirm
+
+      - name: Cache Cargo registry
+        if: steps.analyze.outputs.needs_cross == 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-registry-
+
+      - name: Download sources
+        run: |
+          set -e
+          mkdir -p sources
+          cd sources
+          
+          # Process git_clone steps
+          jq -c '.steps[] | select(.type == "git_clone")' ../build_config.json | while read -r step; do
+            URL=$(echo "$step" | jq -r '.url')
+            BRANCH=$(echo "$step" | jq -r '.branch // "main"')
+            NAME=$(echo "$step" | jq -r '.name // "repo"')
+            
+            echo "Cloning $URL (branch: $BRANCH) into $NAME"
+            git clone --depth 1 --branch "$BRANCH" "$URL" "$NAME"
+          done
+          
+          # Process download steps
+          jq -c '.steps[] | select(.type == "download")' ../build_config.json | while read -r step; do
+            URL=$(echo "$step" | jq -r '.url')
+            FILENAME=$(echo "$step" | jq -r '.filename // "downloaded_file"')
+            
+            echo "Downloading $URL to $FILENAME"
+            curl -L -o "$FILENAME" "$URL"
+            
+            # Extract if it's an archive
+            if [[ "$FILENAME" == *.tar.gz ]] || [[ "$FILENAME" == *.tgz ]]; then
+              echo "Extracting $FILENAME"
+              tar -xzf "$FILENAME"
+            elif [[ "$FILENAME" == *.zip ]]; then
+              echo "Extracting $FILENAME"
+              unzip -q "$FILENAME"
+            fi
+          done
+          
+          echo "All sources downloaded"
+          ls -la
+
+      - name: Execute build steps
+        run: |
+          set -e
+          cd sources
+          
+          # Process build steps
+          jq -c '.steps[] | select(.type == "build")' ../build_config.json | while read -r step; do
+            COMMAND=$(echo "$step" | jq -r '.command')
+            WORKDIR=$(echo "$step" | jq -r '.workdir // "."')
+            TARGET=$(echo "$step" | jq -r '.target // ""')
+            
+            echo "Executing build command: $COMMAND"
+            echo "Working directory: $WORKDIR"
+            
+            if [ "$WORKDIR" != "." ]; then
+              cd "$WORKDIR"
+            fi
+            
+            # Add cross compilation target if specified
+            if [ -n "$TARGET" ] && [[ "$COMMAND" == *"cargo build"* ]]; then
+              if [[ ! "$COMMAND" == *"--target"* ]]; then
+                COMMAND="$COMMAND --target $TARGET"
+              fi
+            fi
+            
+            eval "$COMMAND"
+            
+            if [ "$WORKDIR" != "." ]; then
+              cd ..
+            fi
+          done
+          
+          # Process script steps
+          jq -c '.steps[] | select(.type == "script")' ../build_config.json | while read -r step; do
+            CONTENT=$(echo "$step" | jq -r '.content')
+            
+            echo "Executing script step"
+            echo "$CONTENT" > temp_script.sh
+            chmod +x temp_script.sh
+            ./temp_script.sh
+            rm temp_script.sh
+          done
+          
+          echo "Build completed"
+
+      - name: Find binary
+        id: find_binary
+        run: |
+          set -e
+          cd sources
+          
+          PROJECT_NAME="${{ steps.analyze.outputs.project_name }}"
+          
+          echo "Searching for binary..."
+          
+          # Common binary locations
+          BINARY_PATH=""
+          
+          # Search in target/release for Rust projects
+          if [ -d "target" ]; then
+            BINARY_PATH=$(find target -name "$PROJECT_NAME" -type f -executable | head -1)
+          fi
+          
+          # Search in current directory
+          if [ -z "$BINARY_PATH" ]; then
+            BINARY_PATH=$(find . -name "$PROJECT_NAME" -type f -executable | head -1)
+          fi
+          
+          # Search in bin directories
+          if [ -z "$BINARY_PATH" ]; then
+            BINARY_PATH=$(find . -path "*/bin/$PROJECT_NAME" -type f -executable | head -1)
+          fi
+          
+          # If still not found, get any executable
+          if [ -z "$BINARY_PATH" ]; then
+            BINARY_PATH=$(find . -type f -executable ! -path "*/\.*" | head -1)
+          fi
+          
+          if [ -z "$BINARY_PATH" ]; then
+            echo "ERROR: No binary found"
+            echo "Available files:"
+            find . -type f ! -path "*/\.*" | head -20
+            exit 1
+          fi
+          
+          echo "Found binary: $BINARY_PATH"
+          echo "binary_path=$BINARY_PATH" >> $GITHUB_OUTPUT
+          
+          FILE_SIZE=$(stat -c%s "$BINARY_PATH")
+          FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
+          echo "Binary size: $FILE_SIZE_MB MB"
+          echo "binary_size=$FILE_SIZE_MB" >> $GITHUB_OUTPUT
+
+      - name: Install telegram
+        run: npm install telegram
+
+      - name: Send to Telegram
+        run: |
+          node << 'NODE_SCRIPT'
+          const { TelegramClient, Api } = require('telegram');
+          const { StringSession } = require('telegram/sessions');
+          const fs = require('fs');
+
+          const apiId = parseInt(process.env.TELEGRAM_API_ID);
+          const apiHash = process.env.TELEGRAM_API_HASH;
+          const botToken = process.env.TELEGRAM_BOT_TOKEN;
+          const channelId = process.env.TELEGRAM_CHANNEL_ID;
+          const binaryPath = process.env.BINARY_PATH;
+          const projectName = process.env.PROJECT_NAME;
+          const binarySize = process.env.BINARY_SIZE;
+
+          (async () => {
+            const client = new TelegramClient(new StringSession(''), apiId, apiHash, {
+              connectionRetries: 5
+            });
+            
+            await client.start({ botAuthToken: botToken });
+            console.log('Connected as bot');
+
+            const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+            const fileName = `${projectName}_armv7_${timestamp}`;
+
+            const caption = `Build Successful\nProject: ${projectName}\nTarget: armv7-unknown-linux-musleabihf\nDate: ${timestamp}\nSize: ${binarySize} MB\n\nRun:\nchmod +x ${fileName}\n./${fileName}`;
+
+            let entity = null;
+
+            if (channelId.startsWith('@')) {
+              entity = channelId;
+            } else {
+              const cleanId = parseInt(channelId.replace(/^-100/, ''));
+              
+              try {
+                const result = await client.invoke(
+                  new Api.channels.GetChannels({
+                    id: [new Api.InputChannel({
+                      channelId: BigInt(cleanId),
+                      accessHash: BigInt(0)
+                    })]
+                  })
+                );
+                
+                if (result.chats && result.chats.length > 0) {
+                  entity = result.chats[0];
+                }
+              } catch (err) {
+                console.log('GetChannels failed, trying direct input peer');
+                entity = new Api.InputPeerChannel({
+                  channelId: BigInt(cleanId),
+                  accessHash: BigInt(0)
+                });
+              }
+            }
+
+            console.log('Uploading binary...');
+            
+            await client.sendFile(entity, {
+              file: binaryPath,
+              caption: caption,
+              forceDocument: true,
+              fileName: fileName,
+              workers: 4
+            });
+            
+            console.log('Sent successfully');
+            await client.disconnect();
+          })().catch(err => {
+            console.error('Error:', err.errorMessage || err.message || err);
+            process.exit(1);
+          });
+          NODE_SCRIPT
+        env:
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+          BINARY_PATH: ${{ steps.find_binary.outputs.binary_path }}
+          PROJECT_NAME: ${{ steps.analyze.outputs.project_name }}
+          BINARY_SIZE: ${{ steps.find_binary.outputs.binary_size }}
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -f build_config.json
+          find . -type f -not -path '*/\.*' -not -path './.github/*' -delete 2>/dev/null || true
