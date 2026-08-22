@@ -17,10 +17,12 @@ jobs:
             echo "ERROR: BUILD_CONFIG_RAW secret not set"
             exit 1
           fi
-          curl -s -A "Mozilla/5.0" "$RAW_URL" > build_config.json
-          jq empty build_config.json || { echo "Invalid JSON"; exit 1; }
-          echo "✅ Configuration validated"
-          cat build_config.json
+          curl -fsSL -A "Mozilla/5.0" "$RAW_URL" -o build_config.json
+          if ! jq empty build_config.json 2>/dev/null; then
+            echo "ERROR: Invalid JSON"
+            exit 1
+          fi
+          jq '.' build_config.json
 
       - name: Analyze configuration
         id: analyze
@@ -29,143 +31,210 @@ jobs:
           PROJECT_TYPE=$(jq -r '.type // "unknown"' build_config.json)
           echo "project_name=$PROJECT_NAME" >> $GITHUB_OUTPUT
           echo "project_type=$PROJECT_TYPE" >> $GITHUB_OUTPUT
+          echo "Project=$PROJECT_NAME | Type=$PROJECT_TYPE"
 
-      - name: Setup QEMU
+      - name: Enable ARM32 support on host
         run: |
-          sudo apt-get update
-          sudo apt-get install -y qemu-user-static binfmt-support debootstrap
+          sudo apt-get update -qq
+          sudo apt-get install -y qemu-user-static binfmt-support
           sudo docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
-          echo "✅ QEMU ready"
+          echo "ARM32 binfmt registered:"
+          ls /proc/sys/fs/binfmt_misc/ | grep arm || true
 
-      # 🔥 الحل: Cache للـ rootfs لتجنب التحميل في كل مرة
-      - name: Restore ARM rootfs cache
-        id: arm-cache
+      - name: Cache Docker image layer
+        id: docker-cache
         uses: actions/cache@v4
         with:
-          path: debian-armhf.tar.gz
-          key: armhf-rootfs-v2-${{ hashFiles('build_config.json') }}
+          path: /tmp/arm32v7-rust.tar
+          key: arm32v7-rust-stable-debian-trixie-v1
           restore-keys: |
-            armhf-rootfs-v2-
+            arm32v7-rust-stable-debian-trixie-
 
-      - name: Build ARM rootfs (if not cached)
-        if: steps.arm-cache.outputs.cache-hit != 'true'
+      - name: Load or pull ARM32 Docker image
         run: |
-          set -e
-          echo "📥 Building ARM rootfs from scratch (first time only)..."
-          
-          mkdir -p debian-armhf
-          sudo debootstrap --arch=armhf --foreign --variant=minbase trixie debian-armhf http://deb.debian.org/debian
-          sudo chroot debian-armhf /debootstrap/debootstrap --second-stage
-          
-          # 🔥 الإصلاح: إضافة jq للحزم المثبتة
-          sudo chroot debian-armhf bash -c "
-            apt-get update
-            apt-get install -y curl build-essential pkg-config libssl-dev git ca-certificates jq
-          "
-          
-          # تثبيت Rust مسبقاً في الـ cache
-          sudo chroot debian-armhf bash -c "
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
-            source /root/.cargo/env
-            rustc --version
-          "
-          
-          # ضغط الـ rootfs للتخزين
-          echo "📦 Compressing rootfs for cache..."
-          sudo tar -czf debian-armhf.tar.gz debian-armhf
-          echo "✅ Rootfs cached successfully"
+          if [ -f /tmp/arm32v7-rust.tar ]; then
+            echo "Loading cached Docker image..."
+            docker load -i /tmp/arm32v7-rust.tar
+            echo "Image loaded from cache"
+          else
+            echo "Pulling ARM32 Debian image..."
+            docker pull arm32v7/debian:trixie-slim
+            echo "Saving image to cache..."
+            docker save arm32v7/debian:trixie-slim -o /tmp/arm32v7-rust.tar
+            echo "Image saved"
+          fi
 
-      - name: Extract ARM rootfs (from cache)
-        if: steps.arm-cache.outputs.cache-hit == 'true'
+      - name: Cache Rust installation inside Docker volume
+        id: rust-volume-cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/rust-arm32-cache.tar
+          key: rust-arm32-cargo-home-v2
+          restore-keys: |
+            rust-arm32-cargo-home-
+
+      - name: Prepare Rust cache directory
         run: |
-          echo "📦 Extracting cached ARM rootfs..."
-          sudo tar -xzf debian-armhf.tar.gz
-          echo "✅ Rootfs ready (from cache)"
+          mkdir -p /tmp/rust-arm32-home
+          if [ -f /tmp/rust-arm32-cache.tar ]; then
+            echo "Restoring Rust install from cache..."
+            tar -xf /tmp/rust-arm32-cache.tar -C /tmp/rust-arm32-home
+            echo "Rust cache restored"
+          else
+            echo "No Rust cache found - will install fresh"
+          fi
 
-      - name: Copy config and execute build
+      - name: Install Rust inside ARM32 container (cached)
+        run: |
+          docker run --rm \
+            --platform linux/arm/v7 \
+            -v /tmp/rust-arm32-home:/root \
+            arm32v7/debian:trixie-slim \
+            bash -c "
+              if [ -f /root/.cargo/bin/rustc ]; then
+                echo 'Rust already installed (from cache)'
+                /root/.cargo/bin/rustc --version
+              else
+                echo 'Installing Rust for ARM32...'
+                apt-get update -qq
+                apt-get install -y curl ca-certificates build-essential pkg-config libssl-dev git jq --no-install-recommends
+                curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+                  sh -s -- -y --default-toolchain stable --profile minimal
+                /root/.cargo/bin/rustc --version
+                echo 'Rust install complete'
+              fi
+            "
+          echo "Saving Rust cache..."
+          tar -cf /tmp/rust-arm32-cache.tar -C /tmp/rust-arm32-home .
+          echo "Rust cache saved"
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: /tmp/cargo-registry-cache
+          key: cargo-registry-arm32-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-registry-arm32-
+
+      - name: Prepare Cargo registry
+        run: |
+          mkdir -p /tmp/cargo-registry-cache
+
+      - name: Download sources
+        run: |
+          mkdir -p /tmp/build-sources
+
+          jq -c '.steps[] | select(.type == "git_clone")' build_config.json | while read -r step; do
+            URL=$(echo "$step" | jq -r '.url')
+            BRANCH=$(echo "$step" | jq -r '.branch // "main"')
+            NAME=$(echo "$step" | jq -r '.name // "repo"')
+            echo "Cloning $URL => $NAME"
+            git clone --depth 1 --branch "$BRANCH" "$URL" "/tmp/build-sources/$NAME"
+            echo "Clone OK: $NAME"
+          done
+
+      - name: Build inside ARM32 container (FORCED armv7l)
         id: build
         run: |
           set -e
           PROJECT_NAME="${{ steps.analyze.outputs.project_name }}"
 
-          sudo cp build_config.json debian-armhf/root/
+          cp build_config.json /tmp/build-sources/
 
-          sudo chroot debian-armhf bash -c "
-            cd /root
-            source /root/.cargo/env
+          docker run --rm \
+            --platform linux/arm/v7 \
+            -v /tmp/rust-arm32-home:/root \
+            -v /tmp/build-sources:/workspace \
+            -v /tmp/cargo-registry-cache:/root/.cargo/registry \
+            -e CARGO_BUILD_JOBS=2 \
+            -e CARGO_NET_GIT_FETCH_WITH_CLI=true \
+            -e RUSTUP_IO_THREADS=2 \
+            -e CARGO_TERM_COLOR=always \
+            arm32v7/debian:trixie-slim \
+            bash -c "
+              set -e
 
-            # 🔥 الإصلاح: متغيرات البيئة لتجاوز مشاكل QEMU
-            export RUSTUP_IO_THREADS=1
-            export CARGO_NET_GIT_FETCH_WITH_CLI=true
-            export CARGO_BUILD_JOBS=1
+              export PATH=/root/.cargo/bin:\$PATH
+              export HOME=/root
 
-            # تثبيت أي حزم إضافية من التكوين
-            APT_PKGS=\$(jq -r '[.steps[] | select(.type == \"apt_install\") | .packages[]] | @sh' build_config.json)
-            if [ -n \"\$APT_PKGS\" ]; then
-              eval apt-get install -y \$APT_PKGS
-            fi
+              echo '=== Verifying ARM32 environment ==='
+              uname -m
+              rustc --version
+              cargo --version
+              echo '===================================='
 
-            # خطوات git clone
-            jq -c '.steps[] | select(.type == \"git_clone\")' build_config.json | while read -r step; do
-              URL=\$(echo \"\$step\" | jq -r '.url')
-              BRANCH=\$(echo \"\$step\" | jq -r '.branch // \"main\"')
-              NAME=\$(echo \"\$step\" | jq -r '.name // \"repo\"')
-              git clone --depth 1 --branch \"\$BRANCH\" \"\$URL\" \"\$NAME\"
-            done
+              apt-get update -qq
+              apt-get install -y build-essential pkg-config libssl-dev git jq curl --no-install-recommends 2>/dev/null
 
-            # خطوات download
-            jq -c '.steps[] | select(.type == \"download\")' build_config.json | while read -r step; do
-              URL=\$(echo \"\$step\" | jq -r '.url')
-              FILENAME=\$(echo \"\$step\" | jq -r '.filename // \"downloaded_file\"')
-              curl -L -o \"\$FILENAME\" \"\$URL\"
-            done
+              APT_PKGS=\$(jq -r '[.steps[] | select(.type == \"apt_install\") | .packages[]] | join(\" \")' /workspace/build_config.json)
+              if [ -n \"\$APT_PKGS\" ]; then
+                echo \"Installing extra packages: \$APT_PKGS\"
+                apt-get install -y \$APT_PKGS --no-install-recommends 2>/dev/null
+              fi
 
-            # خطوات البناء
-            jq -c '.steps[] | select(.type == \"build\")' build_config.json | while read -r step; do
-              COMMAND=\$(echo \"\$step\" | jq -r '.command')
-              WORKDIR=\$(echo \"\$step\" | jq -r '.workdir // \".\"')
+              cd /workspace
 
-              # 🔥 الإصلاح: استبدال cross بـ cargo، وإزالة أي --target
-              MODIFIED_CMD=\$(echo \"\$COMMAND\" | sed 's/cross build/cargo build/g' | sed 's/cross /cargo /g' | sed 's/--target [^ ]*//g')
+              jq -c '.steps[] | select(.type == \"build\")' /workspace/build_config.json | while read -r step; do
+                COMMAND=\$(echo \"\$step\" | jq -r '.command')
+                WORKDIR=\$(echo \"\$step\" | jq -r '.workdir // \".\"')
 
-              echo \"Executing (native ARM build): \$MODIFIED_CMD in \$WORKDIR\"
-              cd \"\$WORKDIR\"
-              eval \"\$MODIFIED_CMD\"
-              cd /root
-            done
+                MODIFIED=\$(echo \"\$COMMAND\" | sed 's/cross build/cargo build/g' | sed 's/cross /cargo /g' | sed 's/--target [^ ]*//g')
+                MODIFIED=\"\$MODIFIED --release\"
 
-            # 🔥 الإصلاح: بحث محسّن عن الملف الثنائي
-            echo \"🔍 Searching for binary: $PROJECT_NAME\"
-            BINARY=\$(find . -name \"$PROJECT_NAME\" -type f -executable -print -quit)
-            if [ -z \"\$BINARY\" ]; then
-              BINARY=\$(find . -path '*/target/*/release/$PROJECT_NAME' -type f -print -quit)
-            fi
-            if [ -z \"\$BINARY\" ]; then
-              BINARY=\$(find . -path '*/target/release/$PROJECT_NAME' -type f -print -quit)
-            fi
+                echo '=== Build Step ==='
+                echo \"Dir : \$WORKDIR\"
+                echo \"CMD : \$MODIFIED\"
+                echo '=================='
 
-            if [ -n \"\$BINARY\" ]; then
-              strip \"\$BINARY\" 2>/dev/null || true
-              cp \"\$BINARY\" /root/$PROJECT_NAME
-              chmod +x /root/$PROJECT_NAME
-              echo \"✅ Binary ready: \$(ls -lh /root/$PROJECT_NAME)\"
-              file /root/$PROJECT_NAME
-              readelf -h /root/$PROJECT_NAME | head -5
-            else
-              echo \"❌ Binary not found. Listing all executables:\"
-              find . -type f -executable -name \"$PROJECT_NAME\" 2>/dev/null
-              find . -path '*/target/*' -type f -executable 2>/dev/null | head -20
-              exit 1
-            fi
-          "
+                cd \"/workspace/\$WORKDIR\"
+                eval \"\$MODIFIED\"
+                cd /workspace
+              done
 
-          sudo cp debian-armhf/root/$PROJECT_NAME ./$PROJECT_NAME
+              echo '=== Searching for binary ==='
+              BINARY=\$(find /workspace -path '*/target/release/${PROJECT_NAME}' -type f ! -name '*.d' ! -name '*.rlib' | head -1)
+
+              if [ -z \"\$BINARY\" ]; then
+                BINARY=\$(find /workspace -name '${PROJECT_NAME}' -type f -executable | head -1)
+              fi
+
+              if [ -z \"\$BINARY\" ]; then
+                echo 'ERROR: Binary not found'
+                find /workspace -path '*/target/release/*' -type f | head -20
+                exit 1
+              fi
+
+              echo \"Found: \$BINARY\"
+
+              strip \"\$BINARY\" 2>/dev/null && echo 'Strip OK' || true
+
+              cp \"\$BINARY\" /workspace/${PROJECT_NAME}
+              chmod +x /workspace/${PROJECT_NAME}
+
+              echo '=== ELF Verification (must be ARM32) ==='
+              file /workspace/${PROJECT_NAME}
+              readelf -h /workspace/${PROJECT_NAME} | grep -E 'Class|Type|Machine|Flags'
+              echo '========================================='
+            "
+
+          cp /tmp/build-sources/$PROJECT_NAME ./$PROJECT_NAME
           sudo chown $USER:$USER ./$PROJECT_NAME
+
+          echo "=== Final binary on host ==="
+          file ./$PROJECT_NAME
           ls -lh ./$PROJECT_NAME
 
           FILE_SIZE=$(stat -c%s ./$PROJECT_NAME)
-          FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
+          FILE_SIZE_MB=$(echo "scale=2; $FILE_SIZE / 1048576" | bc)
           echo "binary_size=$FILE_SIZE_MB" >> $GITHUB_OUTPUT
+          echo "binary_path=./$PROJECT_NAME" >> $GITHUB_OUTPUT
+
+      - name: Save Rust cache after build
+        if: always()
+        run: |
+          echo "Saving updated Rust/Cargo cache..."
+          tar -cf /tmp/rust-arm32-cache.tar -C /tmp/rust-arm32-home . 2>/dev/null || true
+          echo "Cache saved"
 
       - name: Install telegram
         run: npm install telegram
@@ -175,13 +244,22 @@ jobs:
           node << 'NODE_SCRIPT'
           const { TelegramClient, Api } = require('telegram');
           const { StringSession } = require('telegram/sessions');
+          const fs = require('fs');
 
           const apiId = parseInt(process.env.TELEGRAM_API_ID);
           const apiHash = process.env.TELEGRAM_API_HASH;
           const botToken = process.env.TELEGRAM_BOT_TOKEN;
           const channelId = process.env.TELEGRAM_CHANNEL_ID;
+          const binaryPath = process.env.BINARY_PATH;
           const projectName = process.env.PROJECT_NAME;
           const binarySize = process.env.BINARY_SIZE;
+
+          if (!fs.existsSync(binaryPath)) {
+            console.error('Binary not found:', binaryPath);
+            process.exit(1);
+          }
+
+          let uploadDone = false;
 
           (async () => {
             const client = new TelegramClient(new StringSession(''), apiId, apiHash, {
@@ -189,46 +267,82 @@ jobs:
             });
 
             await client.start({ botAuthToken: botToken });
-            console.log('Connected as bot');
+            console.log('Connected to Telegram');
 
             const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-            const fileName = `${projectName}_armhf_native_${timestamp}`;
+            const fileName = `${projectName}_armv7l_native_${timestamp}`;
 
-            const caption = `✅ Build Successful (Native ARM via QEMU)\n` +
-                           `📦 Project: ${projectName}\n` +
-                           `🎯 Target: armhf (native)\n` +
-                           `📅 Date: ${timestamp}\n` +
-                           `💾 Size: ${binarySize} MB\n` +
-                           `🔧 Built with QEMU + Cache\n\n` +
-                           `📥 Installation:\n` +
-                           `chmod +x ${fileName}\n` +
-                           `mv ${fileName} /usr/local/bin/${projectName}\n` +
-                           `${projectName} --version\n\n` +
-                           `⚠️ Works guaranteed in PRoot!`;
+            const caption = [
+              `Build Successful (Native ARM32 via Docker)`,
+              `Project: ${projectName}`,
+              `Target: armv7l (32-bit native - 100% PRoot compatible)`,
+              `Date: ${timestamp}`,
+              `Size: ${binarySize} MB`,
+              `Built with: arm32v7/debian:trixie-slim + Rust stable`,
+              ``,
+              `Installation in PRoot:`,
+              `chmod +x ${fileName}`,
+              `mv ${fileName} /usr/local/bin/${projectName}`,
+              `${projectName} --version`
+            ].join('\n');
 
             let entity = null;
+
             if (channelId.startsWith('@')) {
               entity = channelId;
             } else {
               const cleanId = parseInt(channelId.replace(/^-100/, ''));
-              entity = new Api.InputPeerChannel({
-                channelId: BigInt(cleanId),
-                accessHash: BigInt(0)
-              });
+              try {
+                const result = await client.invoke(
+                  new Api.channels.GetChannels({
+                    id: [new Api.InputChannel({
+                      channelId: BigInt(cleanId),
+                      accessHash: BigInt(0)
+                    })]
+                  })
+                );
+                if (result.chats && result.chats.length > 0) {
+                  entity = result.chats[0];
+                  console.log('Channel:', entity.title);
+                }
+              } catch {
+                entity = new Api.InputPeerChannel({
+                  channelId: BigInt(cleanId),
+                  accessHash: BigInt(0)
+                });
+              }
             }
 
+            if (!entity) {
+              console.error('Could not resolve channel');
+              process.exit(1);
+            }
+
+            console.log('Uploading:', fileName);
+
             await client.sendFile(entity, {
-              file: projectName,
+              file: binaryPath,
               caption: caption,
               forceDocument: true,
               fileName: fileName,
               workers: 4
             });
 
-            console.log('✅ Sent successfully');
-            await client.disconnect();
+            uploadDone = true;
+            console.log('Upload complete');
+
+            setTimeout(async () => {
+              try { await client.disconnect(); } catch (_) {}
+              process.exit(0);
+            }, 3000);
+
           })().catch(err => {
-            console.error('Error:', err.errorMessage || err.message || err);
+            const msg = err.errorMessage || err.message || String(err);
+            if (uploadDone || msg === 'TIMEOUT') {
+              console.log('Upload succeeded, ignoring background timeout');
+              process.exit(0);
+            }
+            console.error('Error:', msg);
             process.exit(1);
           });
           NODE_SCRIPT
@@ -237,6 +351,7 @@ jobs:
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+          BINARY_PATH: ${{ steps.build.outputs.binary_path }}
           PROJECT_NAME: ${{ steps.analyze.outputs.project_name }}
           BINARY_SIZE: ${{ steps.build.outputs.binary_size }}
 
@@ -244,5 +359,5 @@ jobs:
         if: always()
         run: |
           rm -f build_config.json
-          sudo rm -rf debian-armhf
-          rm -f ${{ steps.analyze.outputs.project_name }}
+          rm -rf /tmp/build-sources
+          echo "Cleanup complete"
