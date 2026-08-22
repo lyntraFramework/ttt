@@ -62,58 +62,6 @@ jobs:
             docker save arm32v7/debian:trixie-slim -o /tmp/arm32v7-debian-trixie.tar
             echo "Image cached"
           fi
-          docker images | grep debian
-
-      - name: Cache Rust ARM32 installation
-        id: rust-cache
-        uses: actions/cache@v4
-        with:
-          path: /tmp/rust-arm32-home.tar
-          key: rust-arm32-home-stable-v1
-          restore-keys: |
-            rust-arm32-home-stable-
-
-      - name: Prepare Rust home directory
-        run: |
-          mkdir -p /tmp/rust-arm32-home
-          if [ -f /tmp/rust-arm32-home.tar ]; then
-            echo "Restoring Rust from cache..."
-            tar -xf /tmp/rust-arm32-home.tar -C /tmp/rust-arm32-home
-            echo "Rust cache restored"
-          else
-            echo "No Rust cache - will install fresh inside container"
-          fi
-
-      - name: Install Rust inside ARM32 container
-        run: |
-          docker run --rm \
-            --platform linux/arm/v7 \
-            -v /tmp/rust-arm32-home:/root \
-            arm32v7/debian:trixie-slim \
-            bash -c "
-              set -e
-              export HOME=/root
-              export PATH=/root/.cargo/bin:\$PATH
-
-              if [ -f /root/.cargo/bin/rustc ]; then
-                echo 'Rust already installed (from cache)'
-                rustc --version
-                cargo --version
-              else
-                echo 'Installing Rust fresh...'
-                apt-get update -qq
-                apt-get install -y curl ca-certificates build-essential pkg-config libssl-dev git jq --no-install-recommends
-                curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-                  sh -s -- -y --default-toolchain stable --profile minimal
-                /root/.cargo/bin/rustc --version
-                /root/.cargo/bin/cargo --version
-                echo 'Rust installed OK'
-              fi
-            "
-
-          echo "Saving Rust home to cache..."
-          tar -cf /tmp/rust-arm32-home.tar -C /tmp/rust-arm32-home .
-          echo "Rust cache saved"
 
       - name: Cache Cargo registry
         uses: actions/cache@v4
@@ -123,14 +71,14 @@ jobs:
           restore-keys: |
             cargo-registry-arm32-
 
-      - name: Prepare Cargo registry directory
+      - name: Prepare directories
         run: |
           mkdir -p /tmp/cargo-registry
+          mkdir -p /tmp/build-sources
+          mkdir -p /tmp/output
 
       - name: Download sources
         run: |
-          mkdir -p /tmp/build-sources
-
           jq -c '.steps[] | select(.type == "git_clone")' build_config.json | while read -r step; do
             URL=$(echo "$step" | jq -r '.url')
             BRANCH=$(echo "$step" | jq -r '.branch // "main"')
@@ -143,13 +91,12 @@ jobs:
           jq -c '.steps[] | select(.type == "download")' build_config.json | while read -r step; do
             URL=$(echo "$step" | jq -r '.url')
             FILENAME=$(echo "$step" | jq -r '.filename // "file"')
-            echo "Downloading $URL => $FILENAME"
             curl -fSL -o "/tmp/build-sources/$FILENAME" "$URL"
           done
 
           cp build_config.json /tmp/build-sources/
 
-      - name: Build inside ARM32 container
+      - name: Build inside ARM32 container (single run)
         id: build
         run: |
           set -e
@@ -157,34 +104,59 @@ jobs:
 
           docker run --rm \
             --platform linux/arm/v7 \
-            -v /tmp/rust-arm32-home:/root \
             -v /tmp/build-sources:/workspace \
-            -v /tmp/cargo-registry:/root/.cargo/registry \
-            -e HOME=/root \
+            -v /tmp/cargo-registry:/usr/local/cargo-registry \
+            -v /tmp/output:/output \
+            -e DEBIAN_FRONTEND=noninteractive \
             -e CARGO_BUILD_JOBS=2 \
             -e CARGO_NET_GIT_FETCH_WITH_CLI=true \
             -e CARGO_TERM_COLOR=always \
             arm32v7/debian:trixie-slim \
             bash -c "
               set -e
+
+              echo '=== Step 1: Install system packages ==='
+              apt-get update -qq
+              apt-get install -y --no-install-recommends \
+                curl ca-certificates \
+                build-essential \
+                pkg-config \
+                libssl-dev \
+                git \
+                jq \
+                libatomic1
+
+              echo '=== Step 2: Install Rust ==='
               export HOME=/root
+              export CARGO_HOME=/root/.cargo
+              export RUSTUP_HOME=/root/.rustup
+
+              if [ ! -f /root/.cargo/bin/rustc ]; then
+                curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+                  sh -s -- -y --default-toolchain stable --profile minimal
+              fi
+
               export PATH=/root/.cargo/bin:\$PATH
 
-              echo '=== ARM32 Build Environment ==='
-              uname -m
               rustc --version
               cargo --version
-              echo '================================'
 
-              apt-get update -qq
-              apt-get install -y build-essential pkg-config libssl-dev git jq --no-install-recommends 2>/dev/null
+              echo '=== Step 3: Restore Cargo registry cache ==='
+              if [ -d /usr/local/cargo-registry ] && [ \"\$(ls -A /usr/local/cargo-registry 2>/dev/null)\" ]; then
+                echo 'Restoring registry cache...'
+                mkdir -p /root/.cargo/registry
+                cp -r /usr/local/cargo-registry/. /root/.cargo/registry/ 2>/dev/null || true
+                echo 'Registry cache restored'
+              fi
 
+              echo '=== Step 4: Install extra apt packages ==='
               APT_PKGS=\$(jq -r '[.steps[] | select(.type == \"apt_install\") | .packages[]] | join(\" \")' /workspace/build_config.json)
               if [ -n \"\$APT_PKGS\" ]; then
                 echo \"Installing: \$APT_PKGS\"
-                apt-get install -y \$APT_PKGS --no-install-recommends 2>/dev/null
+                apt-get install -y --no-install-recommends \$APT_PKGS 2>/dev/null || true
               fi
 
+              echo '=== Step 5: Build ==='
               cd /workspace
 
               jq -c '.steps[] | select(.type == \"build\")' /workspace/build_config.json | while read -r step; do
@@ -202,22 +174,19 @@ jobs:
                   FINAL_CMD=\"\$MODIFIED --release\"
                 fi
 
-                echo '=== Build Step ==='
-                echo \"Dir : \$WORKDIR\"
-                echo \"Cmd : \$FINAL_CMD\"
-                echo '=================='
+                echo \"Dir: \$WORKDIR\"
+                echo \"Cmd: \$FINAL_CMD\"
 
                 cd /workspace/\$WORKDIR
                 eval \"\$FINAL_CMD\"
                 cd /workspace
               done
 
-              echo '=== Searching binary: ${PROJECT_NAME} ==='
-
-              BINARY=\$(find /workspace -path '*/target/release/${PROJECT_NAME}' -type f ! -name '*.d' ! -name '*.rlib' | head -1)
+              echo '=== Step 6: Find binary ==='
+              BINARY=\$(find /workspace -path \"*/target/release/${PROJECT_NAME}\" -type f ! -name '*.d' ! -name '*.rlib' | head -1)
 
               if [ -z \"\$BINARY\" ]; then
-                BINARY=\$(find /workspace -name '${PROJECT_NAME}' -type f -executable ! -path '*/.git/*' | head -1)
+                BINARY=\$(find /workspace -name \"${PROJECT_NAME}\" -type f -executable ! -path '*/.git/*' | head -1)
               fi
 
               if [ -z \"\$BINARY\" ]; then
@@ -229,16 +198,21 @@ jobs:
               echo \"Found: \$BINARY\"
               strip \"\$BINARY\" 2>/dev/null && echo 'Strip OK' || true
 
-              cp \"\$BINARY\" /workspace/${PROJECT_NAME}_output
-              chmod +x /workspace/${PROJECT_NAME}_output
+              cp \"\$BINARY\" /output/${PROJECT_NAME}
+              chmod +x /output/${PROJECT_NAME}
 
-              echo '=== ELF Verification ==='
-              file /workspace/${PROJECT_NAME}_output
-              readelf -h /workspace/${PROJECT_NAME}_output | grep -E 'Class|Type|Machine|Flags'
-              echo '======================='
+              echo '=== Step 7: ELF Verification ==='
+              file /output/${PROJECT_NAME}
+              readelf -h /output/${PROJECT_NAME} | grep -E 'Class|Type|Machine|Flags'
+
+              echo '=== Step 8: Save Cargo registry cache ==='
+              if [ -d /root/.cargo/registry ]; then
+                cp -r /root/.cargo/registry/. /usr/local/cargo-registry/ 2>/dev/null || true
+                echo 'Registry cache saved'
+              fi
             "
 
-          cp /tmp/build-sources/${PROJECT_NAME}_output ./${PROJECT_NAME}
+          cp /tmp/output/${PROJECT_NAME} ./${PROJECT_NAME}
           chmod +x ./${PROJECT_NAME}
 
           echo "=== Final binary ==="
@@ -247,14 +221,11 @@ jobs:
 
           FILE_SIZE=$(stat -c%s ./${PROJECT_NAME})
           FILE_SIZE_MB=$(echo "scale=2; $FILE_SIZE / 1048576" | bc)
-          echo "binary_size=$FILE_SIZE_MB" >> $GITHUB_OUTPUT
-          echo "binary_path=./${PROJECT_NAME}" >> $GITHUB_OUTPUT
 
-      - name: Save updated Rust cache
-        if: always()
-        run: |
-          tar -cf /tmp/rust-arm32-home.tar -C /tmp/rust-arm32-home . 2>/dev/null || true
-          echo "Rust cache updated"
+          echo "BINARY_PATH=./${PROJECT_NAME}" >> $GITHUB_ENV
+          echo "BINARY_SIZE=${FILE_SIZE_MB}" >> $GITHUB_ENV
+          echo "binary_path=./${PROJECT_NAME}" >> $GITHUB_OUTPUT
+          echo "binary_size=${FILE_SIZE_MB}" >> $GITHUB_OUTPUT
 
       - name: Install telegram
         run: npm install telegram
@@ -293,12 +264,12 @@ jobs:
             const fileName = `${projectName}_armv7l_native_${timestamp}`;
 
             const caption = [
-              `Build Successful (Native ARM32 via Docker QEMU)`,
+              `Build Successful (Native ARM32 Docker)`,
               `Project: ${projectName}`,
               `Target: armv7l Debian Trixie (100% PRoot compatible)`,
               `Date: ${timestamp}`,
               `Size: ${binarySize} MB`,
-              `Built with: arm32v7/debian:trixie-slim`,
+              `Built with: arm32v7/debian:trixie-slim + Rust stable`,
               ``,
               `Installation:`,
               `chmod +x ${fileName}`,
@@ -371,14 +342,13 @@ jobs:
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
-          BINARY_PATH: ${{ steps.build.outputs.binary_path }}
+          BINARY_PATH: ${{ env.BINARY_PATH }}
           PROJECT_NAME: ${{ steps.analyze.outputs.project_name }}
-          BINARY_SIZE: ${{ steps.build.outputs.binary_size }}
+          BINARY_SIZE: ${{ env.BINARY_SIZE }}
 
       - name: Cleanup
         if: always()
         run: |
           rm -f build_config.json
-          rm -rf /tmp/build-sources
+          rm -rf /tmp/build-sources /tmp/output
           echo "Cleanup complete"
-        
