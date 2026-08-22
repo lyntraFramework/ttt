@@ -6,61 +6,62 @@ on:
 jobs:
   analyze-and-build:
     runs-on: ubuntu-latest
-    
+
     steps:
       - uses: actions/checkout@v4
 
       - name: Fetch configuration
         run: |
           RAW_URL="${{ secrets.BUILD_CONFIG_RAW }}"
-          
+
           if [ -z "$RAW_URL" ]; then
             echo "ERROR: BUILD_CONFIG_RAW secret not set"
             exit 1
           fi
-          
-          echo "Fetching configuration..."
-          curl -s -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" "$RAW_URL" > build_config.json
-          
+
+          curl -fsSL -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" "$RAW_URL" -o build_config.json
+
           if ! jq empty build_config.json 2>/dev/null; then
-            echo "ERROR: Invalid JSON in configuration file"
+            echo "ERROR: Invalid JSON"
+            cat build_config.json
             exit 1
           fi
-          
-          echo "Configuration validated successfully"
-          cat build_config.json | jq '.'
+
+          jq '.' build_config.json
 
       - name: Analyze configuration
         id: analyze
         run: |
           PROJECT_NAME=$(jq -r '.project_name // "unknown-project"' build_config.json)
           PROJECT_TYPE=$(jq -r '.type // "unknown"' build_config.json)
-          
+
           echo "project_name=$PROJECT_NAME" >> $GITHUB_OUTPUT
           echo "project_type=$PROJECT_TYPE" >> $GITHUB_OUTPUT
-          
+
           NEEDS_CROSS="false"
           if [[ "$PROJECT_TYPE" == "rust" ]]; then
             NEEDS_CROSS="true"
           fi
-          
-          echo "needs_cross=$NEEDS_CROSS" >> $GITHUB_OUTPUT
 
-      - name: Install dependencies
+          echo "needs_cross=$NEEDS_CROSS" >> $GITHUB_OUTPUT
+          echo "=== Project: $PROJECT_NAME | Type: $PROJECT_TYPE | NeedsCross: $NEEDS_CROSS ==="
+
+      - name: Install system dependencies
         run: |
-          set -e
-          sudo apt-get update
-          
-          if ! command -v jq &> /dev/null; then
-            sudo apt-get install -y jq
-          fi
-          
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            jq \
+            gcc-arm-linux-gnueabihf \
+            binutils-arm-linux-gnueabihf \
+            file \
+            curl \
+            git \
+            unzip
+
           jq -r '.steps[] | select(.type == "apt_install") | .packages[]' build_config.json | while read -r pkg; do
-            echo "Installing: $pkg"
-            sudo apt-get install -y "$pkg" || echo "Warning: failed to install $pkg"
+            echo "Installing apt package: $pkg"
+            sudo apt-get install -y "$pkg" || echo "Warning: failed to install $pkg, continuing"
           done
-          
-          echo "System dependencies installed"
 
       - name: Install Rust toolchain
         if: steps.analyze.outputs.needs_cross == 'true'
@@ -68,24 +69,50 @@ jobs:
         with:
           targets: armv7-unknown-linux-gnueabihf
 
-      - name: Install Zig and cargo-zigbuild
+      - name: Install Zig
         if: steps.analyze.outputs.needs_cross == 'true'
         run: |
-          set -e
-          echo "Installing Zig compiler..."
-          sudo snap install zig --classic --edge 2>/dev/null || {
-            ZIG_VERSION="0.13.0"
-            curl -L "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz" | sudo tar -xJ -C /opt
-            sudo ln -sf /opt/zig-linux-x86_64-${ZIG_VERSION}/zig /usr/local/bin/zig
-          }
-          
-          echo "Installing cargo-zigbuild..."
-          cargo install cargo-zigbuild
-          
-          echo "Verifying installations..."
-          zig version
-          cargo-zigbuild --version
-          
+          ZIG_VERSION="0.13.0"
+          ZIG_DIR="zig-linux-x86_64-${ZIG_VERSION}"
+          ZIG_TAR="${ZIG_DIR}.tar.xz"
+
+          curl -fSL "https://ziglang.org/download/${ZIG_VERSION}/${ZIG_TAR}" -o "/tmp/${ZIG_TAR}"
+
+          sudo tar -xJ -C /opt -f "/tmp/${ZIG_TAR}"
+          sudo ln -sf "/opt/${ZIG_DIR}/zig" /usr/local/bin/zig
+
+          ZIG_VER_OUT=$(zig version)
+          echo "Zig installed: $ZIG_VER_OUT"
+
+          if [ -z "$ZIG_VER_OUT" ]; then
+            echo "ERROR: Zig installation failed"
+            exit 1
+          fi
+
+      - name: Install cargo-zigbuild
+        if: steps.analyze.outputs.needs_cross == 'true'
+        run: |
+          cargo install cargo-zigbuild --locked
+
+          ZIGBUILD_VER=$(cargo-zigbuild --version)
+          echo "cargo-zigbuild installed: $ZIGBUILD_VER"
+
+          if [ -z "$ZIGBUILD_VER" ]; then
+            echo "ERROR: cargo-zigbuild installation failed"
+            exit 1
+          fi
+
+      - name: Configure Cargo linker
+        if: steps.analyze.outputs.needs_cross == 'true'
+        run: |
+          mkdir -p .cargo
+          cat > .cargo/config.toml << 'CARGO_CONFIG'
+          [target.armv7-unknown-linux-gnueabihf]
+          linker = "arm-linux-gnueabihf-gcc"
+          CARGO_CONFIG
+
+          echo "Cargo config written:"
+          cat .cargo/config.toml
 
       - name: Cache Cargo registry
         if: steps.analyze.outputs.needs_cross == 'true'
@@ -101,128 +128,208 @@ jobs:
 
       - name: Download sources
         run: |
-          set -e
           mkdir -p sources
           cd sources
-          
+
           jq -c '.steps[] | select(.type == "git_clone")' ../build_config.json | while read -r step; do
             URL=$(echo "$step" | jq -r '.url')
             BRANCH=$(echo "$step" | jq -r '.branch // "main"')
             NAME=$(echo "$step" | jq -r '.name // "repo"')
-            
-            echo "Cloning $URL (branch: $BRANCH) into $NAME"
+
+            echo "Cloning $URL => $NAME (branch: $BRANCH)"
             git clone --depth 1 --branch "$BRANCH" "$URL" "$NAME"
+
+            if [ ! -d "$NAME" ]; then
+              echo "ERROR: Clone failed for $URL"
+              exit 1
+            fi
+
+            echo "Clone OK: $NAME"
           done
-          
+
           jq -c '.steps[] | select(.type == "download")' ../build_config.json | while read -r step; do
             URL=$(echo "$step" | jq -r '.url')
             FILENAME=$(echo "$step" | jq -r '.filename // "downloaded_file"')
-            
-            echo "Downloading $URL to $FILENAME"
-            curl -L -o "$FILENAME" "$URL"
-            
+
+            echo "Downloading $URL => $FILENAME"
+            curl -fSL -o "$FILENAME" "$URL"
+
             if [[ "$FILENAME" == *.tar.gz ]] || [[ "$FILENAME" == *.tgz ]]; then
               tar -xzf "$FILENAME"
             elif [[ "$FILENAME" == *.zip ]]; then
               unzip -q "$FILENAME"
             fi
-          done
-          
-          echo "All sources downloaded"
 
-      - name: Execute build steps (zigbuild for PRoot compatibility)
+            echo "Download OK: $FILENAME"
+          done
+
+      - name: Execute build steps
         run: |
           set -e
           cd sources
-          
+
           jq -c '.steps[] | select(.type == "build")' ../build_config.json | while read -r step; do
             COMMAND=$(echo "$step" | jq -r '.command')
             WORKDIR=$(echo "$step" | jq -r '.workdir // "."')
-            
-            echo "Original command: $COMMAND"
+
+            echo "=== Build Step ==="
+            echo "Original command : $COMMAND"
             echo "Working directory: $WORKDIR"
-            
+
             if [ "$WORKDIR" != "." ]; then
               cd "$WORKDIR"
             fi
-            
-            # استبدال cross بـ zigbuild تلقائياً للتوافق مع PRoot
-            MODIFIED_COMMAND=$(echo "$COMMAND" | sed 's/cross build/cargo zigbuild/g' | sed 's/cross /cargo zigbuild /g')
-            
-            # استبدال musleabihf بـ gnueabihf.2.17 للتوافق مع Debian armhf
-            MODIFIED_COMMAND=$(echo "$MODIFIED_COMMAND" | sed 's/armv7-unknown-linux-musleabihf/armv7-unknown-linux-gnueabihf.2.17/g')
-            MODIFIED_COMMAND=$(echo "$MODIFIED_COMMAND" | sed 's/armv7-unknown-linux-gnueabihf$/armv7-unknown-linux-gnueabihf.2.17/g')
-            
-            echo "Modified command (PRoot-safe): $MODIFIED_COMMAND"
-            
-            eval "$MODIFIED_COMMAND"
-            
+
+            MODIFIED=$(echo "$COMMAND" | sed 's|cross build|cargo zigbuild|g' | sed 's|cross |cargo zigbuild |g')
+            MODIFIED=$(echo "$MODIFIED" | sed 's|armv7-unknown-linux-musleabihf|armv7-unknown-linux-gnueabihf.2.17|g')
+            MODIFIED=$(echo "$MODIFIED" | sed 's|armv7-unknown-linux-gnueabihf\b|armv7-unknown-linux-gnueabihf.2.17|g')
+
+            echo "Modified command : $MODIFIED"
+            echo "=================="
+
+            eval "$MODIFIED"
+            BUILD_EXIT=$?
+
+            if [ $BUILD_EXIT -ne 0 ]; then
+              echo "ERROR: Build failed with exit code $BUILD_EXIT"
+              exit $BUILD_EXIT
+            fi
+
+            echo "Build step completed OK"
+
             if [ "$WORKDIR" != "." ]; then
               cd ..
             fi
           done
-          
+
           jq -c '.steps[] | select(.type == "script")' ../build_config.json | while read -r step; do
             CONTENT=$(echo "$step" | jq -r '.content')
-            
-            echo "Executing script step"
             echo "$CONTENT" > temp_script.sh
             chmod +x temp_script.sh
             ./temp_script.sh
             rm temp_script.sh
           done
-          
-          echo "Build completed"
 
       - name: Find and prepare binary
         id: find_binary
         run: |
           set -e
           cd sources
-          
+
           PROJECT_NAME="${{ steps.analyze.outputs.project_name }}"
-          
           echo "Searching for binary: $PROJECT_NAME"
-          
+
           BINARY_PATH=""
-          
-          # البحث في target لمشاريع Rust (zigbuild output)
+
           if [ -d "target" ]; then
-            BINARY_PATH=$(find target -name "$PROJECT_NAME" -type f -executable | head -1)
+            BINARY_PATH=$(find target -path "*/armv7-unknown-linux-gnueabihf/release/${PROJECT_NAME}" -type f ! -name "*.d" ! -name "*.rlib" | head -1)
           fi
-          
+
           if [ -z "$BINARY_PATH" ]; then
-            BINARY_PATH=$(find . -name "$PROJECT_NAME" -type f -executable | head -1)
+            BINARY_PATH=$(find . -name "$PROJECT_NAME" -type f -executable ! -path "*/.git/*" | head -1)
           fi
-          
+
           if [ -z "$BINARY_PATH" ]; then
             BINARY_PATH=$(find . -path "*/bin/$PROJECT_NAME" -type f -executable | head -1)
           fi
-          
+
           if [ -z "$BINARY_PATH" ]; then
-            BINARY_PATH=$(find . -type f -executable ! -path "*/\.*" ! -name "*.sh" | head -1)
-          fi
-          
-          if [ -z "$BINARY_PATH" ]; then
-            echo "ERROR: No binary found"
-            find . -type f ! -path "*/\.*" | head -30
+            echo "ERROR: Binary '$PROJECT_NAME' not found. All executables found:"
+            find . -type f -executable ! -path "*/.git/*" ! -name "*.sh" | head -30
             exit 1
           fi
-          
-          echo "Found binary: $BINARY_PATH"
-          
-          # Strip binary لتقليل الحجم
-          strip "$BINARY_PATH" 2>/dev/null || true
-          
-          cp "$BINARY_PATH" "../$PROJECT_NAME"
-          chmod +x "../$PROJECT_NAME"
-          
-          FILE_SIZE=$(stat -c%s "../$PROJECT_NAME")
-          FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
-          echo "Binary size: $FILE_SIZE_MB MB"
-          
-          echo "binary_path=$PROJECT_NAME" >> $GITHUB_OUTPUT
-          echo "binary_size=$FILE_SIZE_MB" >> $GITHUB_OUTPUT
+
+          echo "Binary found: $BINARY_PATH"
+
+          arm-linux-gnueabihf-strip "$BINARY_PATH" 2>/dev/null && echo "Strip OK" || echo "Strip skipped"
+
+          cp "$BINARY_PATH" "../${PROJECT_NAME}"
+          chmod +x "../${PROJECT_NAME}"
+
+          FILE_SIZE=$(stat -c%s "../${PROJECT_NAME}")
+          FILE_SIZE_MB=$(echo "scale=2; $FILE_SIZE / 1048576" | bc)
+
+          echo "Binary size: ${FILE_SIZE_MB} MB"
+          echo "binary_name=${PROJECT_NAME}" >> $GITHUB_OUTPUT
+          echo "binary_path=./${PROJECT_NAME}" >> $GITHUB_OUTPUT
+          echo "binary_size=${FILE_SIZE_MB}" >> $GITHUB_OUTPUT
+
+      - name: Verify binary PRoot compatibility
+        run: |
+          PROJECT_NAME="${{ steps.analyze.outputs.project_name }}"
+          BINARY="./${PROJECT_NAME}"
+
+          echo "========================================"
+          echo "   ELF Verification Report"
+          echo "========================================"
+
+          ELF_CLASS=$(arm-linux-gnueabihf-readelf -h "$BINARY" | grep "Class:" | awk '{print $2}')
+          ELF_TYPE=$(arm-linux-gnueabihf-readelf -h "$BINARY" | grep "Type:" | awk '{print $2}')
+          ELF_MACHINE=$(arm-linux-gnueabihf-readelf -h "$BINARY" | grep "Machine:" | cut -d: -f2 | xargs)
+          ELF_FLAGS=$(arm-linux-gnueabihf-readelf -h "$BINARY" | grep "Flags:" | awk '{print $2}')
+          INTERP=$(arm-linux-gnueabihf-readelf -l "$BINARY" 2>/dev/null | grep "interpreter" | sed 's/.*\[\(.*\)\]/\1/' | head -1 || echo "static-no-interp")
+
+          echo "Class       : $ELF_CLASS"
+          echo "Type        : $ELF_TYPE"
+          echo "Machine     : $ELF_MACHINE"
+          echo "ELF Flags   : $ELF_FLAGS"
+          echo "Interpreter : $INTERP"
+          echo "File size   : $(du -sh $BINARY | cut -f1)"
+          echo "File type   : $(file $BINARY)"
+          echo "========================================"
+
+          PASS=true
+
+          if [[ "$ELF_CLASS" != "ELF32" ]]; then
+            echo "FAIL: Expected ELF32, got $ELF_CLASS"
+            PASS=false
+          else
+            echo "PASS: ELF32 confirmed"
+          fi
+
+          if [[ "$ELF_MACHINE" != *"ARM"* ]]; then
+            echo "FAIL: Expected ARM machine, got: $ELF_MACHINE"
+            PASS=false
+          else
+            echo "PASS: ARM machine confirmed"
+          fi
+
+          if echo "$ELF_FLAGS" | grep -qi "unrecognized"; then
+            echo "FAIL: Unrecognized EABI flags - PRoot will reject this binary"
+            PASS=false
+          else
+            echo "PASS: EABI flags are recognized"
+          fi
+
+          if [[ "$INTERP" == *"ld-linux-armhf.so.3"* ]] || [[ "$INTERP" == *"static"* ]]; then
+            echo "PASS: Interpreter is PRoot-compatible ($INTERP)"
+          elif [[ "$INTERP" == *"musl"* ]]; then
+            echo "WARNING: musl interpreter detected - may fail on PRoot Debian"
+          else
+            echo "INFO: Interpreter: $INTERP"
+          fi
+
+          if [[ "$ELF_TYPE" == "DYN" ]]; then
+            echo "INFO: DYN type detected - checking PIE vs shared lib"
+            HAS_MAIN=$(arm-linux-gnueabihf-nm "$BINARY" 2>/dev/null | grep -c " T main" || echo "0")
+            if [ "$HAS_MAIN" -gt 0 ]; then
+              echo "PASS: DYN with main() = PIE executable (OK for PRoot)"
+            else
+              echo "WARNING: DYN without main() = shared library, not executable"
+            fi
+          elif [[ "$ELF_TYPE" == "EXEC" ]]; then
+            echo "PASS: EXEC type (ideal for PRoot)"
+          fi
+
+          echo "========================================"
+
+          if [ "$PASS" = false ]; then
+            echo "FINAL: VERIFICATION FAILED - binary may not work in PRoot"
+            exit 1
+          fi
+
+          echo "FINAL: ALL CHECKS PASSED - binary is PRoot-compatible"
+          echo "========================================"
 
       - name: Install telegram
         run: npm install telegram
@@ -242,35 +349,42 @@ jobs:
           const projectName = process.env.PROJECT_NAME;
           const binarySize = process.env.BINARY_SIZE;
 
+          if (!fs.existsSync(binaryPath)) {
+            console.error('Binary not found at:', binaryPath);
+            process.exit(1);
+          }
+
           (async () => {
             const client = new TelegramClient(new StringSession(''), apiId, apiHash, {
               connectionRetries: 5
             });
-            
+
             await client.start({ botAuthToken: botToken });
-            console.log('Connected as bot');
+            console.log('Connected to Telegram');
 
             const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-            const fileName = `${projectName}_armv7l_prroot_${timestamp}`;
+            const fileName = `${projectName}_armv7l_proot_${timestamp}`;
 
-            const caption = `✅ Build Successful (PRoot-zigbuild Compatible)\n` +
-                           `📦 Project: ${projectName}\n` +
-                           `🎯 Target: armv7l-gnueabihf (32-bit PRoot)\n` +
-                           `📅 Date: ${timestamp}\n` +
-                           `💾 Size: ${binarySize} MB\n` +
-                           `🔧 Built with: cargo-zigbuild (glibc 2.17)\n\n` +
-                           `📥 Installation:\n` +
-                           `chmod +x ${fileName}\n` +
-                           `mv ${fileName} /usr/local/bin/${projectName}\n` +
-                           `${projectName} --version`;
+            const caption = [
+              `Build Successful (PRoot-zigbuild)`,
+              `Project: ${projectName}`,
+              `Target: armv7l-gnueabihf (32-bit)`,
+              `Date: ${timestamp}`,
+              `Size: ${binarySize} MB`,
+              `Built with: cargo-zigbuild + glibc 2.17`,
+              ``,
+              `Installation in PRoot:`,
+              `chmod +x ${fileName}`,
+              `mv ${fileName} /usr/local/bin/${projectName}`,
+              `${projectName} --version`
+            ].join('\n');
 
-            let entity = null;
+            let entity;
 
             if (channelId.startsWith('@')) {
               entity = channelId;
             } else {
               const cleanId = parseInt(channelId.replace(/^-100/, ''));
-              
               try {
                 const result = await client.invoke(
                   new Api.channels.GetChannels({
@@ -280,12 +394,12 @@ jobs:
                     })]
                   })
                 );
-                
                 if (result.chats && result.chats.length > 0) {
                   entity = result.chats[0];
+                  console.log('Channel resolved:', entity.title);
                 }
               } catch (err) {
-                console.log('GetChannels failed, trying direct input peer');
+                console.log('Fallback to InputPeerChannel');
                 entity = new Api.InputPeerChannel({
                   channelId: BigInt(cleanId),
                   accessHash: BigInt(0)
@@ -293,8 +407,13 @@ jobs:
               }
             }
 
+            if (!entity) {
+              console.error('Could not resolve channel entity');
+              process.exit(1);
+            }
+
             console.log('Uploading binary...');
-            
+
             await client.sendFile(entity, {
               file: binaryPath,
               caption: caption,
@@ -302,11 +421,12 @@ jobs:
               fileName: fileName,
               workers: 4
             });
-            
-            console.log('Sent successfully');
+
+            console.log('Upload complete');
             await client.disconnect();
+
           })().catch(err => {
-            console.error('Error:', err.errorMessage || err.message || err);
+            console.error('Telegram error:', err.errorMessage || err.message || String(err));
             process.exit(1);
           });
           NODE_SCRIPT
@@ -323,5 +443,5 @@ jobs:
         if: always()
         run: |
           rm -f build_config.json
-          rm -rf sources
-          echo "Cleaned up"
+          rm -rf sources .cargo
+          echo "Cleanup complete"
