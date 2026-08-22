@@ -74,7 +74,6 @@ jobs:
           set -e
           echo "Installing Zig compiler..."
           sudo snap install zig --classic --edge 2>/dev/null || {
-            # Fallback: manual install
             ZIG_VERSION="0.13.0"
             curl -L "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz" | sudo tar -xJ -C /opt
             sudo ln -sf /opt/zig-linux-x86_64-${ZIG_VERSION}/zig /usr/local/bin/zig
@@ -85,7 +84,8 @@ jobs:
           
           echo "Verifying installations..."
           zig version
-          cargo zigbuild --version
+          cargo-zigbuild --version
+          
 
       - name: Cache Cargo registry
         if: steps.analyze.outputs.needs_cross == 'true'
