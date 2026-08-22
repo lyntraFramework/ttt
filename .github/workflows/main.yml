@@ -30,46 +30,82 @@ jobs:
           echo "project_name=$PROJECT_NAME" >> $GITHUB_OUTPUT
           echo "project_type=$PROJECT_TYPE" >> $GITHUB_OUTPUT
 
-      - name: Setup QEMU and ARM chroot
+      - name: Setup QEMU
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-user-static binfmt-support debootstrap
           sudo docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
           echo "✅ QEMU ready"
 
-      - name: Create ARM rootfs and build
+      # 🔥 الحل: Cache للـ rootfs لتجنب التحميل في كل مرة
+      - name: Restore ARM rootfs cache
+        id: arm-cache
+        uses: actions/cache@v4
+        with:
+          path: debian-armhf.tar.gz
+          key: armhf-rootfs-v2-${{ hashFiles('build_config.json') }}
+          restore-keys: |
+            armhf-rootfs-v2-
+
+      - name: Build ARM rootfs (if not cached)
+        if: steps.arm-cache.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          echo "📥 Building ARM rootfs from scratch (first time only)..."
+          
+          mkdir -p debian-armhf
+          sudo debootstrap --arch=armhf --foreign --variant=minbase trixie debian-armhf http://deb.debian.org/debian
+          sudo chroot debian-armhf /debootstrap/debootstrap --second-stage
+          
+          # 🔥 الإصلاح: إضافة jq للحزم المثبتة
+          sudo chroot debian-armhf bash -c "
+            apt-get update
+            apt-get install -y curl build-essential pkg-config libssl-dev git ca-certificates jq
+          "
+          
+          # تثبيت Rust مسبقاً في الـ cache
+          sudo chroot debian-armhf bash -c "
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+            source /root/.cargo/env
+            rustc --version
+          "
+          
+          # ضغط الـ rootfs للتخزين
+          echo "📦 Compressing rootfs for cache..."
+          sudo tar -czf debian-armhf.tar.gz debian-armhf
+          echo "✅ Rootfs cached successfully"
+
+      - name: Extract ARM rootfs (from cache)
+        if: steps.arm-cache.outputs.cache-hit == 'true'
+        run: |
+          echo "📦 Extracting cached ARM rootfs..."
+          sudo tar -xzf debian-armhf.tar.gz
+          echo "✅ Rootfs ready (from cache)"
+
+      - name: Copy config and execute build
         id: build
         run: |
           set -e
           PROJECT_NAME="${{ steps.analyze.outputs.project_name }}"
 
-          mkdir -p arm-root
-          cd arm-root
-
-          echo "📥 Downloading Debian armhf (trixie)..."
-          sudo debootstrap --arch=armhf --foreign --variant=minbase trixie debian-armhf http://deb.debian.org/debian
-
-          sudo chroot debian-armhf /debootstrap/debootstrap --second-stage
-
-          sudo chroot debian-armhf bash -c "
-            apt-get update
-            apt-get install -y curl build-essential pkg-config libssl-dev git ca-certificates
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-            source /root/.cargo/env
-            rustc --version
-          "
-
-          sudo cp ../build_config.json debian-armhf/root/
+          sudo cp build_config.json debian-armhf/root/
 
           sudo chroot debian-armhf bash -c "
             cd /root
             source /root/.cargo/env
 
+            # 🔥 الإصلاح: متغيرات البيئة لتجاوز مشاكل QEMU
+            export RUSTUP_IO_THREADS=1
+            export CARGO_NET_GIT_FETCH_WITH_CLI=true
+            export CARGO_BUILD_JOBS=1
+
+            # تثبيت أي حزم إضافية من التكوين
             APT_PKGS=\$(jq -r '[.steps[] | select(.type == \"apt_install\") | .packages[]] | @sh' build_config.json)
             if [ -n \"\$APT_PKGS\" ]; then
               eval apt-get install -y \$APT_PKGS
             fi
 
+            # خطوات git clone
             jq -c '.steps[] | select(.type == \"git_clone\")' build_config.json | while read -r step; do
               URL=\$(echo \"\$step\" | jq -r '.url')
               BRANCH=\$(echo \"\$step\" | jq -r '.branch // \"main\"')
@@ -77,12 +113,14 @@ jobs:
               git clone --depth 1 --branch \"\$BRANCH\" \"\$URL\" \"\$NAME\"
             done
 
+            # خطوات download
             jq -c '.steps[] | select(.type == \"download\")' build_config.json | while read -r step; do
               URL=\$(echo \"\$step\" | jq -r '.url')
               FILENAME=\$(echo \"\$step\" | jq -r '.filename // \"downloaded_file\"')
               curl -L -o \"\$FILENAME\" \"\$URL\"
             done
 
+            # خطوات البناء
             jq -c '.steps[] | select(.type == \"build\")' build_config.json | while read -r step; do
               COMMAND=\$(echo \"\$step\" | jq -r '.command')
               WORKDIR=\$(echo \"\$step\" | jq -r '.workdir // \".\"')
@@ -96,9 +134,14 @@ jobs:
               cd /root
             done
 
-            BINARY=\$(find . -name \"$PROJECT_NAME\" -type f -executable | head -1)
+            # 🔥 الإصلاح: بحث محسّن عن الملف الثنائي
+            echo \"🔍 Searching for binary: $PROJECT_NAME\"
+            BINARY=\$(find . -name \"$PROJECT_NAME\" -type f -executable -print -quit)
             if [ -z \"\$BINARY\" ]; then
-              BINARY=\$(find . -path '*/target/*/release/$PROJECT_NAME' -type f | head -1)
+              BINARY=\$(find . -path '*/target/*/release/$PROJECT_NAME' -type f -print -quit)
+            fi
+            if [ -z \"\$BINARY\" ]; then
+              BINARY=\$(find . -path '*/target/release/$PROJECT_NAME' -type f -print -quit)
             fi
 
             if [ -n \"\$BINARY\" ]; then
@@ -109,16 +152,19 @@ jobs:
               file /root/$PROJECT_NAME
               readelf -h /root/$PROJECT_NAME | head -5
             else
-              echo \"❌ Binary not found\"
+              echo \"❌ Binary not found. Listing all executables:\"
+              find . -type f -executable -name \"$PROJECT_NAME\" 2>/dev/null
+              find . -path '*/target/*' -type f -executable 2>/dev/null | head -20
               exit 1
             fi
           "
 
-          cp debian-armhf/root/$PROJECT_NAME ../$PROJECT_NAME
-          ls -lh ../$PROJECT_NAME
+          sudo cp debian-armhf/root/$PROJECT_NAME ./$PROJECT_NAME
+          sudo chown $USER:$USER ./$PROJECT_NAME
+          ls -lh ./$PROJECT_NAME
 
-          FILE_SIZE=\$(stat -c%s ../$PROJECT_NAME)
-          FILE_SIZE_MB=\$((FILE_SIZE / 1024 / 1024))
+          FILE_SIZE=$(stat -c%s ./$PROJECT_NAME)
+          FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
           echo "binary_size=$FILE_SIZE_MB" >> $GITHUB_OUTPUT
 
       - name: Install telegram
@@ -129,7 +175,6 @@ jobs:
           node << 'NODE_SCRIPT'
           const { TelegramClient, Api } = require('telegram');
           const { StringSession } = require('telegram/sessions');
-          const fs = require('fs');
 
           const apiId = parseInt(process.env.TELEGRAM_API_ID);
           const apiHash = process.env.TELEGRAM_API_HASH;
@@ -151,10 +196,10 @@ jobs:
 
             const caption = `✅ Build Successful (Native ARM via QEMU)\n` +
                            `📦 Project: ${projectName}\n` +
-                           `🎯 Target: armhf (native, NO cross-compilation)\n` +
+                           `🎯 Target: armhf (native)\n` +
                            `📅 Date: ${timestamp}\n` +
                            `💾 Size: ${binarySize} MB\n` +
-                           `🔧 Built inside Debian armhf via QEMU\n\n` +
+                           `🔧 Built with QEMU + Cache\n\n` +
                            `📥 Installation:\n` +
                            `chmod +x ${fileName}\n` +
                            `mv ${fileName} /usr/local/bin/${projectName}\n` +
@@ -199,5 +244,5 @@ jobs:
         if: always()
         run: |
           rm -f build_config.json
-          rm -rf arm-root
+          sudo rm -rf debian-armhf
           rm -f ${{ steps.analyze.outputs.project_name }}
