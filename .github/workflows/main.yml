@@ -19,7 +19,7 @@ jobs:
           fi
           curl -fsSL -A "Mozilla/5.0" "$RAW_URL" > build_config.json
           jq empty build_config.json || { echo "Invalid JSON"; exit 1; }
-          echo "✅ Configuration validated"
+          echo "✅ Configuration validated"a
           cat build_config.json
 
       - name: Analyze configuration
