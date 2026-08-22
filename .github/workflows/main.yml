@@ -192,6 +192,7 @@ jobs:
           
           BINARY_PATH=""
           
+          # البحث في target لمشاريع Rust
           if [ -d "target" ]; then
             BINARY_PATH=$(find target -name "$PROJECT_NAME" -type f -executable | head -1)
           fi
@@ -215,13 +216,20 @@ jobs:
           fi
           
           echo "Found binary: $BINARY_PATH"
-          echo "binary_path=$BINARY_PATH" >> $GITHUB_OUTPUT
           
-          FILE_SIZE=$(stat -c%s "$BINARY_PATH")
+          # 🆕 نسخ الملف إلى المجلد الجذري مع اسم موحد
+          cp "$BINARY_PATH" "../$PROJECT_NAME"
+          chmod +x "../$PROJECT_NAME"
+          
+          FILE_SIZE=$(stat -c%s "../$PROJECT_NAME")
           FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
           echo "Binary size: $FILE_SIZE_MB MB"
+          
+          # 🆕 إرجاع المسار الجديد (من المجلد الجذري)
+          echo "binary_path=$PROJECT_NAME" >> $GITHUB_OUTPUT
           echo "binary_size=$FILE_SIZE_MB" >> $GITHUB_OUTPUT
 
+          
       - name: Install telegram
         run: npm install telegram
 
