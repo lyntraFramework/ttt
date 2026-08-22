@@ -34,10 +34,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-user-static binfmt-support debootstrap
-
-          # تسجيل QEMU لجميع المعماريات
           sudo docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
-
           echo "✅ QEMU ready"
 
       - name: Create ARM rootfs and build
@@ -46,17 +43,14 @@ jobs:
           set -e
           PROJECT_NAME="${{ steps.analyze.outputs.project_name }}"
 
-          # إنشاء مجلد ARM rootfs
           mkdir -p arm-root
           cd arm-root
 
-          # تحميل Debian armhf minimal
-          echo "📥 Downloading Debian armhf..."
+          echo "📥 Downloading Debian armhf (trixie)..."
           sudo debootstrap --arch=armhf --foreign --variant=minbase trixie debian-armhf http://deb.debian.org/debian
 
           sudo chroot debian-armhf /debootstrap/debootstrap --second-stage
 
-          # تثبيت الأدوات داخل ARM
           sudo chroot debian-armhf bash -c "
             apt-get update
             apt-get install -y curl build-essential pkg-config libssl-dev git ca-certificates
@@ -65,21 +59,17 @@ jobs:
             rustc --version
           "
 
-          # نسخ التكوين والدخول
           sudo cp ../build_config.json debian-armhf/root/
 
-          # تنفيذ خطوات البناء
           sudo chroot debian-armhf bash -c "
             cd /root
             source /root/.cargo/env
 
-            # قراءة خطوات JSON
             APT_PKGS=\$(jq -r '[.steps[] | select(.type == \"apt_install\") | .packages[]] | @sh' build_config.json)
             if [ -n \"\$APT_PKGS\" ]; then
               eval apt-get install -y \$APT_PKGS
             fi
 
-            # خطوات git clone
             jq -c '.steps[] | select(.type == \"git_clone\")' build_config.json | while read -r step; do
               URL=\$(echo \"\$step\" | jq -r '.url')
               BRANCH=\$(echo \"\$step\" | jq -r '.branch // \"main\"')
@@ -87,28 +77,25 @@ jobs:
               git clone --depth 1 --branch \"\$BRANCH\" \"\$URL\" \"\$NAME\"
             done
 
-            # خطوات download
             jq -c '.steps[] | select(.type == \"download\")' build_config.json | while read -r step; do
               URL=\$(echo \"\$step\" | jq -r '.url')
               FILENAME=\$(echo \"\$step\" | jq -r '.filename // \"downloaded_file\"')
               curl -L -o \"\$FILENAME\" \"\$URL\"
             done
 
-            # خطوات البناء
             jq -c '.steps[] | select(.type == \"build\")' build_config.json | while read -r step; do
               COMMAND=\$(echo \"\$step\" | jq -r '.command')
               WORKDIR=\$(echo \"\$step\" | jq -r '.workdir // \".\"')
 
-              # استبدال cross بـ cargo (نحن native الآن)
-              MODIFIED_CMD=\$(echo \"\$COMMAND\" | sed 's/cross build/cargo build/g' | sed 's/--target [^ ]*//g')
+              # 🔥 الإصلاح: استبدال cross بـ cargo، وإزالة أي --target
+              MODIFIED_CMD=\$(echo \"\$COMMAND\" | sed 's/cross build/cargo build/g' | sed 's/cross /cargo /g' | sed 's/--target [^ ]*//g')
 
-              echo \"Executing: \$MODIFIED_CMD in \$WORKDIR\"
+              echo \"Executing (native ARM build): \$MODIFIED_CMD in \$WORKDIR\"
               cd \"\$WORKDIR\"
               eval \"\$MODIFIED_CMD\"
               cd /root
             done
 
-            # نسخ النتيجة
             BINARY=\$(find . -name \"$PROJECT_NAME\" -type f -executable | head -1)
             if [ -z \"\$BINARY\" ]; then
               BINARY=\$(find . -path '*/target/*/release/$PROJECT_NAME' -type f | head -1)
@@ -127,7 +114,6 @@ jobs:
             fi
           "
 
-          # استخراج الملف
           cp debian-armhf/root/$PROJECT_NAME ../$PROJECT_NAME
           ls -lh ../$PROJECT_NAME
 
@@ -163,7 +149,7 @@ jobs:
             const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
             const fileName = `${projectName}_armhf_native_${timestamp}`;
 
-            const caption = `✅ Build Successful (Native ARM Build via QEMU)\n` +
+            const caption = `✅ Build Successful (Native ARM via QEMU)\n` +
                            `📦 Project: ${projectName}\n` +
                            `🎯 Target: armhf (native, NO cross-compilation)\n` +
                            `📅 Date: ${timestamp}\n` +
