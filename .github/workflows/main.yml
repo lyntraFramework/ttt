@@ -63,14 +63,6 @@ jobs:
             echo "Image cached"
           fi
 
-      - name: Cache Cargo registry
-        uses: actions/cache@v4
-        with:
-          path: /tmp/cargo-registry
-          key: cargo-registry-arm32-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            cargo-registry-arm32-
-
       - name: Prepare directories
         run: |
           mkdir -p /tmp/cargo-registry
@@ -95,6 +87,27 @@ jobs:
           done
 
           cp build_config.json /tmp/build-sources/
+
+      # [إصلاح 3] نقل خطوة الكاش وحساب البصمة يدوياً بعد تحميل الكود
+      - name: Compute Cargo Lock Hash
+        id: cargo-hash
+        run: |
+          HASH="no-lock"
+          for lockfile in /tmp/build-sources/*/Cargo.lock; do
+            if [ -f "$lockfile" ]; then
+              HASH=$(sha256sum "$lockfile" | awk '{print $1}')
+              break
+            fi
+          done
+          echo "hash=$HASH" >> $GITHUB_OUTPUT
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: /tmp/cargo-registry
+          key: cargo-registry-arm32-${{ steps.cargo-hash.outputs.hash }}
+          restore-keys: |
+            cargo-registry-arm32-
 
       - name: Build inside ARM32 container (single run)
         id: build
@@ -124,7 +137,9 @@ jobs:
                 libssl-dev \
                 git \
                 jq \
-                libatomic1
+                libatomic1 \
+                file \
+                binutils
 
               echo '=== Step 2: Install Rust ==='
               export HOME=/root
@@ -346,9 +361,10 @@ jobs:
           PROJECT_NAME: ${{ steps.analyze.outputs.project_name }}
           BINARY_SIZE: ${{ env.BINARY_SIZE }}
 
+      # [إصلاح 2] استخدام sudo لحذف الملفات التي أنشأها Docker بصلاحيات root
       - name: Cleanup
         if: always()
         run: |
           rm -f build_config.json
-          rm -rf /tmp/build-sources /tmp/output
+          sudo rm -rf /tmp/build-sources /tmp/output /tmp/cargo-registry
           echo "Cleanup complete"
