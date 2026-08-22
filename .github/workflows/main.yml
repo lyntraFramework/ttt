@@ -1,4 +1,4 @@
-name: Smart Builder
+name: Smart Builder (ARMHF Compatible)
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
 jobs:
   analyze-and-build:
     runs-on: ubuntu-latest
-
+    
     steps:
       - uses: actions/checkout@v4
 
@@ -17,12 +17,10 @@ jobs:
             echo "ERROR: BUILD_CONFIG_RAW secret not set"
             exit 1
           fi
-          curl -fsSL -A "Mozilla/5.0" "$RAW_URL" -o build_config.json
-          if ! jq empty build_config.json 2>/dev/null; then
-            echo "ERROR: Invalid JSON"
-            exit 1
-          fi
-          jq '.' build_config.json
+          curl -fsSL -A "Mozilla/5.0" "$RAW_URL" > build_config.json
+          jq empty build_config.json || { echo "Invalid JSON"; exit 1; }
+          echo "✅ Configuration validated"
+          cat build_config.json
 
       - name: Analyze configuration
         id: analyze
@@ -31,37 +29,13 @@ jobs:
           PROJECT_TYPE=$(jq -r '.type // "unknown"' build_config.json)
           echo "project_name=$PROJECT_NAME" >> $GITHUB_OUTPUT
           echo "project_type=$PROJECT_TYPE" >> $GITHUB_OUTPUT
-          echo "Project=$PROJECT_NAME | Type=$PROJECT_TYPE"
 
-      - name: Enable ARM32 QEMU support
+      - name: Setup QEMU and ARM chroot
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y qemu-user-static binfmt-support
-          docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
-          echo "ARM32 binfmt registered"
-
-      - name: Cache Docker image
-        id: docker-cache
-        uses: actions/cache@v4
-        with:
-          path: /tmp/arm32v7-debian-trixie.tar
-          key: arm32v7-debian-trixie-slim-v1
-          restore-keys: |
-            arm32v7-debian-trixie-slim-
-
-      - name: Load or pull ARM32 Docker image
-        run: |
-          if [ -f /tmp/arm32v7-debian-trixie.tar ]; then
-            echo "Loading Docker image from cache..."
-            docker load -i /tmp/arm32v7-debian-trixie.tar
-            echo "Image loaded"
-          else
-            echo "Pulling arm32v7/debian:trixie-slim..."
-            docker pull --platform linux/arm/v7 arm32v7/debian:trixie-slim
-            echo "Saving image to cache..."
-            docker save arm32v7/debian:trixie-slim -o /tmp/arm32v7-debian-trixie.tar
-            echo "Image cached"
-          fi
+          sudo apt-get install -y qemu-user-static binfmt-support debootstrap
+          sudo docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
+          echo "✅ QEMU ready"
 
       - name: Prepare directories
         run: |
@@ -88,28 +62,7 @@ jobs:
 
           cp build_config.json /tmp/build-sources/
 
-      # [إصلاح 3] نقل خطوة الكاش وحساب البصمة يدوياً بعد تحميل الكود
-      - name: Compute Cargo Lock Hash
-        id: cargo-hash
-        run: |
-          HASH="no-lock"
-          for lockfile in /tmp/build-sources/*/Cargo.lock; do
-            if [ -f "$lockfile" ]; then
-              HASH=$(sha256sum "$lockfile" | awk '{print $1}')
-              break
-            fi
-          done
-          echo "hash=$HASH" >> $GITHUB_OUTPUT
-
-      - name: Cache Cargo registry
-        uses: actions/cache@v4
-        with:
-          path: /tmp/cargo-registry
-          key: cargo-registry-arm32-${{ steps.cargo-hash.outputs.hash }}
-          restore-keys: |
-            cargo-registry-arm32-
-
-      - name: Build inside ARM32 container (single run)
+      - name: Build inside ARM32 container
         id: build
         run: |
           set -e
@@ -141,7 +94,13 @@ jobs:
                 file \
                 binutils
 
-              echo '=== Step 2: Install Rust ==='
+              echo '=== Step 2: Extract installed packages ==='
+              dpkg-query -W -f='\${binary:Package} \${Version}\n' | sort > /tmp/installed_packages.txt
+              echo 'First 20 installed packages:'
+              head -n 20 /tmp/installed_packages.txt
+              cp /tmp/installed_packages.txt /output/installed_packages.txt
+
+              echo '=== Step 3: Install Rust ==='
               export HOME=/root
               export CARGO_HOME=/root/.cargo
               export RUSTUP_HOME=/root/.rustup
@@ -152,11 +111,10 @@ jobs:
               fi
 
               export PATH=/root/.cargo/bin:\$PATH
-
               rustc --version
               cargo --version
 
-              echo '=== Step 3: Restore Cargo registry cache ==='
+              echo '=== Step 4: Restore Cargo registry cache ==='
               if [ -d /usr/local/cargo-registry ] && [ \"\$(ls -A /usr/local/cargo-registry 2>/dev/null)\" ]; then
                 echo 'Restoring registry cache...'
                 mkdir -p /root/.cargo/registry
@@ -164,14 +122,14 @@ jobs:
                 echo 'Registry cache restored'
               fi
 
-              echo '=== Step 4: Install extra apt packages ==='
+              echo '=== Step 5: Install extra apt packages ==='
               APT_PKGS=\$(jq -r '[.steps[] | select(.type == \"apt_install\") | .packages[]] | join(\" \")' /workspace/build_config.json)
               if [ -n \"\$APT_PKGS\" ]; then
                 echo \"Installing: \$APT_PKGS\"
                 apt-get install -y --no-install-recommends \$APT_PKGS 2>/dev/null || true
               fi
 
-              echo '=== Step 5: Build ==='
+              echo '=== Step 6: Build ==='
               cd /workspace
 
               jq -c '.steps[] | select(.type == \"build\")' /workspace/build_config.json | while read -r step; do
@@ -197,7 +155,7 @@ jobs:
                 cd /workspace
               done
 
-              echo '=== Step 6: Find binary ==='
+              echo '=== Step 7: Find binary ==='
               BINARY=\$(find /workspace -path \"*/target/release/${PROJECT_NAME}\" -type f ! -name '*.d' ! -name '*.rlib' | head -1)
 
               if [ -z \"\$BINARY\" ]; then
@@ -216,11 +174,11 @@ jobs:
               cp \"\$BINARY\" /output/${PROJECT_NAME}
               chmod +x /output/${PROJECT_NAME}
 
-              echo '=== Step 7: ELF Verification ==='
+              echo '=== Step 8: ELF Verification ==='
               file /output/${PROJECT_NAME}
-              readelf -h /output/${PROJECT_NAME} | grep -E 'Class|Type|Machine|Flags'
+              readelf -h /output/${PROJECT_NAME} | grep -E 'Class|Type|Machine|Flags' || true
 
-              echo '=== Step 8: Save Cargo registry cache ==='
+              echo '=== Step 9: Save Cargo registry cache ==='
               if [ -d /root/.cargo/registry ]; then
                 cp -r /root/.cargo/registry/. /usr/local/cargo-registry/ 2>/dev/null || true
                 echo 'Registry cache saved'
@@ -361,7 +319,6 @@ jobs:
           PROJECT_NAME: ${{ steps.analyze.outputs.project_name }}
           BINARY_SIZE: ${{ env.BINARY_SIZE }}
 
-      # [إصلاح 2] استخدام sudo لحذف الملفات التي أنشأها Docker بصلاحيات root
       - name: Cleanup
         if: always()
         run: |
