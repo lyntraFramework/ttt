@@ -242,21 +242,22 @@ jobs:
 
           "$ANDROID_STRIP" "$BINARY" 2>/dev/null && echo "Strip OK" || echo "Strip skipped"
 
-          cp "$BINARY" ./${PROJECT_NAME}
-          chmod +x ./${PROJECT_NAME}
+          ABSOLUTE_BINARY_PATH="/tmp/build-sources/${PROJECT_NAME}"
+          cp "$BINARY" "$ABSOLUTE_BINARY_PATH"
+          chmod +x "$ABSOLUTE_BINARY_PATH"
 
           echo "=== ELF Verification (must be ARM Android) ==="
-          file ./${PROJECT_NAME}
-          readelf -h ./${PROJECT_NAME} | grep -E "Class|Type|Machine|Flags"
+          file "$ABSOLUTE_BINARY_PATH"
+          readelf -h "$ABSOLUTE_BINARY_PATH" | grep -E "Class|Type|Machine|Flags"
           echo "Dynamic deps (must be minimal for Termux):"
-          readelf -d ./${PROJECT_NAME} | grep NEEDED || echo "No dynamic deps (static)"
+          readelf -d "$ABSOLUTE_BINARY_PATH" | grep NEEDED || echo "No dynamic deps (static)"
           echo "================================================"
 
-          FILE_SIZE=$(stat -c%s ./${PROJECT_NAME})
+          FILE_SIZE=$(stat -c%s "$ABSOLUTE_BINARY_PATH")
           FILE_SIZE_MB=$(echo "scale=2; $FILE_SIZE / 1048576" | bc)
           echo "Size: ${FILE_SIZE_MB} MB"
 
-          echo "BINARY_PATH=./${PROJECT_NAME}" >> $GITHUB_ENV
+          echo "BINARY_PATH=$ABSOLUTE_BINARY_PATH" >> $GITHUB_ENV
           echo "BINARY_SIZE=${FILE_SIZE_MB}" >> $GITHUB_ENV
 
       - name: Install telegram
